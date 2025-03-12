@@ -61,51 +61,64 @@ async function unrestrict(api, chatId, userId) {
   console.log(`Attempting to unrestrict user ${userId} in chat ${chatId} using multiple methods`);
   
   try {
-    // First approach: Simple permission object
-    console.log("Method 1: Using simple permission object");
-    await api.restrictChatMember(chatId, userId, {
-      can_send_messages: true,
-      can_send_media_messages: true,
-      can_send_other_messages: true,
-      can_add_web_page_previews: true
-    });
+    // First approach: Simple permission object (old style)
+    console.log("Method 1: Using simple permission object (old style)");
+    try {
+      await api.restrictChatMember(chatId, userId, {
+        can_send_messages: true,
+        can_send_media_messages: true,
+        can_send_other_messages: true,
+        can_add_web_page_previews: true
+      });
+      console.log("Method 1 succeeded");
+    } catch (error) {
+      console.log("Method 1 failed:", error.message);
+    }
     
     // Wait a moment between methods
     await delay(1000);
     
     // Second approach: Using the full permission object
     console.log("Method 2: Using full permission object");
-    await api.restrictChatMember(chatId, userId, {
-      permissions: {
-        can_send_messages: true,
-        can_send_media_messages: true,
-        can_send_other_messages: true,
-        can_add_web_page_previews: true
-      }
-    });
+    try {
+      await api.restrictChatMember(chatId, userId, {
+        permissions: {
+          can_send_messages: true,
+          can_send_media_messages: true,
+          can_send_other_messages: true,
+          can_add_web_page_previews: true
+        }
+      });
+      console.log("Method 2 succeeded");
+    } catch (error) {
+      console.log("Method 2 failed:", error.message);
+    }
     
     // Wait a moment between methods
     await delay(1000);
     
-    // Third approach: Try promoteChatMember with minimal permissions
-    console.log("Method 3: Using promoteChatMember");
+    // Third approach: Using the comprehensive permission object
+    console.log("Method 3: Using comprehensive permission object");
     try {
-      await api.promoteChatMember(chatId, userId, {
-        can_change_info: false,
-        can_post_messages: false,
-        can_edit_messages: false,
-        can_delete_messages: false,
-        can_invite_users: true,
-        can_restrict_members: false,
-        can_pin_messages: false,
-        can_promote_members: false,
-        can_manage_chat: false,
-        can_manage_video_chats: false
+      await api.restrictChatMember(chatId, userId, {
+        permissions: {
+          can_send_messages: true,
+          can_send_media_messages: true,
+          can_send_other_messages: true,
+          can_add_web_page_previews: true,
+          can_send_polls: true,
+          can_send_audios: true,
+          can_send_documents: true,
+          can_send_photos: true,
+          can_send_videos: true,
+          can_send_video_notes: true,
+          can_send_voice_notes: true,
+          can_invite_users: true
+        }
       });
-      console.log("promoteChatMember succeeded");
-    } catch (promoteError) {
-      console.log("promoteChatMember failed (this is normal if user is not an admin):", promoteError.message);
-      // This is expected to fail for regular users, so we continue
+      console.log("Method 3 succeeded");
+    } catch (error) {
+      console.log("Method 3 failed:", error.message);
     }
     
     console.log("All unrestriction methods attempted");
@@ -423,6 +436,7 @@ bot.on("chat_member", async (ctx) => {
     }
     
     const member = ctx.chatMember.new_chat_member;
+    const oldMember = ctx.chatMember.old_chat_member;
     
     // Safely check if me exists
     if (!ctx.me) {
@@ -430,20 +444,78 @@ bot.on("chat_member", async (ctx) => {
       return;
     }
 
-    // Only process if a new user joined and it's not the bot itself
-    if (member.status === "member" && member.user.id !== ctx.me.id) {
+    // Skip if it's the bot itself
+    if (member.user.id === ctx.me.id) {
+      console.log("Ignoring chat_member event for the bot itself");
+      return;
+    }
+    
+    // Safely check if chat exists
+    if (!ctx.chat) {
+      console.log("ctx.chat is undefined");
+      return;
+    }
+    
+    const userId = member.user.id;
+    const chatId = ctx.chat.id;
+    const chatTitle = ctx.chat.title || "the group";
+    
+    console.log(`Processing chat_member event for user ${userId} with status ${member.status}`);
+    
+    // Check if the user was just restricted (either by this bot or another admin)
+    if (member.status === "restricted" && 
+        (!oldMember || oldMember.status !== "restricted" || 
+         (oldMember.can_send_messages && !member.can_send_messages))) {
+      
+      console.log(`User ${userId} was restricted, generating captcha`);
+      
+      // Generate a new captcha
+      const captcha = generateCaptcha();
+      console.log(`Generated captcha: ${captcha} for user ${userId}`);
+      
+      // Store the captcha in the database with attempts field
+      console.log(`Attempting to store captcha in database: user_id=${userId}, chat_id=${chatId}, captcha=${captcha}`);
+      try {
+        // Explicitly disable RLS for this operation
+        const captchaData = {
+          user_id: userId,
+          chat_id: chatId,
+          captcha: captcha,
+          attempts: 0,
+          created_at: new Date().toISOString(),
+        };
+        
+        console.log("Captcha data to insert:", JSON.stringify(captchaData));
+        
+        const { data, error } = await supabase
+          .from("captchas")
+          .insert(captchaData);
+        
+        if (error) {
+          console.error("Database error when storing captcha:", error);
+          console.error("Error details:", JSON.stringify(error));
+        } else {
+          console.log("Captcha stored successfully, response:", JSON.stringify(data));
+        }
+        
+        // Send captcha message in the group
+        console.log("Sending captcha message");
+        await ctx.api.sendMessage(
+          chatId,
+          addAttribution(
+            `Welcome, ${member.user.first_name}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
+          ),
+        );
+        console.log("Captcha message sent successfully");
+      } catch (error) {
+        console.error("Error generating captcha:", error);
+      }
+    } 
+    // Also handle new members joining
+    else if (member.status === "member" && (!oldMember || oldMember.status !== "member")) {
+      // New member joined
       console.log(`New member joined: ${member.user.first_name} (${member.user.id})`);
       
-      // Safely check if chat exists
-      if (!ctx.chat) {
-        console.log("ctx.chat is undefined");
-        return;
-      }
-      
-      const userId = member.user.id;
-      const chatId = ctx.chat.id;
-      const chatTitle = ctx.chat.title || "the group";
-
       // Generate a new captcha
       const captcha = generateCaptcha();
       console.log(`Generated captcha: ${captcha} for user ${userId}`);
@@ -484,19 +556,6 @@ bot.on("chat_member", async (ctx) => {
             console.error("Error details:", JSON.stringify(error));
           } else {
             console.log("Captcha stored successfully, response:", JSON.stringify(data));
-            
-            // Verify the captcha was stored
-            const { data: verifyData, error: verifyError } = await supabase
-              .from("captchas")
-              .select("*")
-              .eq("user_id", userId)
-              .eq("chat_id", chatId);
-              
-            if (verifyError) {
-              console.error("Error verifying captcha storage:", verifyError);
-            } else {
-              console.log(`Verification found ${verifyData.length} captchas:`, JSON.stringify(verifyData));
-            }
           }
         } catch (dbError) {
           console.error("Exception during database operation:", dbError);
@@ -515,7 +574,7 @@ bot.on("chat_member", async (ctx) => {
         console.error("Error handling new member:", error);
       }
     } else {
-      console.log(`Ignoring chat_member event: status=${member.status}, is_bot=${member.user.id === ctx.me.id}`);
+      console.log(`Ignoring chat_member event: status=${member.status}, old_status=${oldMember ? oldMember.status : 'unknown'}`);
     }
   } catch (error) {
     console.error("Error in chat_member handler:", error);
@@ -588,19 +647,6 @@ bot.on("message:new_chat_members", async (ctx) => {
             console.error("Error details:", JSON.stringify(error));
           } else {
             console.log("Captcha stored successfully, response:", JSON.stringify(data));
-            
-            // Verify the captcha was stored
-            const { data: verifyData, error: verifyError } = await supabase
-              .from("captchas")
-              .select("*")
-              .eq("user_id", userId)
-              .eq("chat_id", chatId);
-              
-            if (verifyError) {
-              console.error("Error verifying captcha storage:", verifyError);
-            } else {
-              console.log(`Verification found ${verifyData.length} captchas:`, JSON.stringify(verifyData));
-            }
           }
         } catch (dbError) {
           console.error("Exception during database operation:", dbError);
