@@ -298,8 +298,6 @@ bot.on("message:text", async (ctx) => {
 
 // Handle the /start command
 bot.command("start", async (ctx) => {
-  // ...
-}); {
   try {
     console.log("Received /start command");
     await ctx.reply(
@@ -315,8 +313,6 @@ bot.command("start", async (ctx) => {
 
 // Add debug command
 bot.command("debug", async (ctx) => {
-  // ...
-}); {
   try {
     console.log("Received /debug command");
     
@@ -371,53 +367,41 @@ bot.catch((err) => {
 
 // Vercel serverless function handler
 module.exports = async (req, res) => {
-  // Handle CORS preflight requests
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'authorization, x-client-info, apikey, content-type');
-    return res.status(200).end();
-  }
-  
   try {
-    console.log("Received webhook request");
+    // Handle CORS preflight requests
+    if (req.method === 'OPTIONS') {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Headers', 'authorization, x-client-info, apikey, content-type');
+      return res.status(200).end();
+    }
     
-    // Parse the update safely
+    console.log("Webhook received a request");
+    
+    // Safely parse the update
     let update;
     try {
       update = req.body;
       console.log("Update payload:", JSON.stringify(update));
     } catch (error) {
       console.error("Error parsing update JSON:", error);
-      return res.status(400).json({ error: "Invalid JSON" });
+      return res.status(200).send("OK"); // Still return 200 to Telegram
     }
     
-    // Check update type for debugging
-    if (update.chat_member) {
-      console.log("Detected chat_member update");
-      if (update.chat_member.new_chat_member) {
-        console.log("New member status:", update.chat_member.new_chat_member.status);
-        if (update.chat_member.new_chat_member.user) {
-          console.log("User info:", JSON.stringify(update.chat_member.new_chat_member.user));
-        }
+    // Process the update
+    if (update) {
+      try {
+        await bot.handleUpdate(update);
+        console.log("Update processed successfully");
+      } catch (error) {
+        console.error("Error in bot.handleUpdate:", error);
       }
     }
     
-    if (update.message && update.message.new_chat_members && update.message.new_chat_members.length > 0) {
-      console.log("Detected new_chat_members via message");
-      console.log("New members:", JSON.stringify(update.message.new_chat_members));
-    }
-    
-    // Handle the update with error catching
-    try {
-      await bot.handleUpdate(update);
-      console.log("Update processed successfully");
-    } catch (error) {
-      console.error("Error in bot.handleUpdate:", error);
-    }
-  } catch (err) {
-    console.error("Error processing update:", err);
+    // Always return 200 OK to Telegram
+    return res.status(200).send("OK");
+  } catch (error) {
+    console.error("Critical error in webhook handler:", error);
+    // Always return 200 OK to Telegram even on error
+    return res.status(200).send("OK");
   }
-  
-  // Always return OK to Telegram
-  res.status(200).send("OK");
 };
