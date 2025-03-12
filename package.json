@@ -1,1 +1,17 @@
-
+{
+  "name": "telegram-captcha-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot that requires users to complete a captcha to enter a group",
+  "main": "api/telegram-bot.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel deploy --prod"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "grammy": "^1.19.2"
+  },
+  "devDependencies": {
+    "vercel": "^32.5.0"
+  }
+}
