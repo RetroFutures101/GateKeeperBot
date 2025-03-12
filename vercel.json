@@ -1,1 +1,15 @@
-
+{
+  "version": 2,
+  "functions": {
+    "api/telegram-bot.js": {
+      "memory": 1024,
+      "maxDuration": 10
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/telegram-bot",
+      "dest": "/api/telegram-bot.js"
+    }
+  ]
+}
