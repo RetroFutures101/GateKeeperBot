@@ -64,34 +64,37 @@ bot.on("message:text", async (ctx) => {
       console.log("Message received in private chat, checking for captchas");
       
       // Check database for captchas for this user
-      console.log("Checking database for captchas");
+      console.log(`Looking for captchas for user ID: ${userId}`);
       const { data, error } = await supabase
         .from("captchas")
-        .select("captcha, chat_id")
+        .select("*")
         .eq("user_id", userId)
         .order("created_at", { ascending: false });
       
       if (error) {
         console.error("Database error when checking captcha:", error);
+        console.error("Error details:", JSON.stringify(error));
         await ctx.reply("Sorry, there was an error checking your captcha. Please try again later.");
         return;
       }
       
+      console.log(`Query returned ${data ? data.length : 0} captchas`);
       if (data && data.length > 0) {
-        console.log(`Found ${data.length} captchas in database for user ${userId}`);
+        console.log("Captchas found:", JSON.stringify(data));
+        
         let captchaVerified = false;
         let groupChatId = null;
         let captchaAttempts = 0;
+        let captchaRecord = null;
         
         // Check if any of the captchas match the user input
-        for (const captchaRecord of data) {
-          console.log(`Comparing user input "${userInput}" with captcha "${captchaRecord.captcha}"`);
-          if (userInput === captchaRecord.captcha) {
+        for (const record of data) {
+          console.log(`Comparing user input "${userInput}" with captcha "${record.captcha}"`);
+          if (userInput === record.captcha) {
             captchaVerified = true;
-            groupChatId = captchaRecord.chat_id;
+            groupChatId = record.chat_id;
+            captchaRecord = record;
             break;
-          } else {
-            captchaAttempts++;
           }
         }
         
@@ -149,38 +152,25 @@ bot.on("message:text", async (ctx) => {
           console.log(`Incorrect captcha for user ${userId}`);
           
           // Update attempts in database
-          const { data: attemptsData, error: attemptsError } = await supabase
-            .from("captchas")
-            .select("attempts")
-            .eq("user_id", userId)
-            .eq("chat_id", data[0].chat_id)
-            .single();
-          
-          let attempts = 1;
-          if (!attemptsError && attemptsData) {
-            attempts = (attemptsData.attempts || 0) + 1;
-          }
-          
-          // Update attempts in database
+          const attempts = (captchaRecord.attempts || 0) + 1;
           await supabase
             .from("captchas")
             .update({ attempts: attempts })
-            .eq("user_id", userId)
-            .eq("chat_id", data[0].chat_id);
+            .eq("id", captchaRecord.id);
           
           if (attempts >= 3) {
             // Too many failed attempts, kick the user
-            console.log(`Too many failed attempts for user ${userId}, kicking from chat ${data[0].chat_id}`);
+            console.log(`Too many failed attempts for user ${userId}, kicking from chat ${captchaRecord.chat_id}`);
             try {
-              await ctx.api.banChatMember(data[0].chat_id, userId);
-              await ctx.api.unbanChatMember(data[0].chat_id, userId); // Unban immediately to allow rejoining
+              await ctx.api.banChatMember(captchaRecord.chat_id, userId);
+              await ctx.api.unbanChatMember(captchaRecord.chat_id, userId); // Unban immediately to allow rejoining
               console.log(`User ${userId} kicked and unbanned`);
               
               await ctx.reply(addAttribution(`❌ Too many failed attempts. You have been removed from the group. You can rejoin and try again if you wish.`));
               
               // Delete the captcha from the database
               console.log(`Deleting captcha for user ${userId}`);
-              await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", data[0].chat_id);
+              await supabase.from("captchas").delete().eq("id", captchaRecord.id);
             } catch (error) {
               console.error("Error kicking user:", error);
               await ctx.reply("There was an error processing your captcha. Please contact the group admin.");
@@ -195,7 +185,7 @@ bot.on("message:text", async (ctx) => {
           return;
         }
       } else {
-        console.log("No captcha found for user");
+        console.log("No captchas found in database for user", userId);
         await ctx.reply("I don't have any pending captchas for you. If you were recently added to a group, please try again or contact the group admin.");
         return;
       }
@@ -208,7 +198,7 @@ bot.on("message:text", async (ctx) => {
     console.log(`Checking for captcha for user ${userId} in chat ${chatId}`);
     const { data, error } = await supabase
       .from("captchas")
-      .select("captcha, attempts")
+      .select("*")
       .eq("user_id", userId)
       .eq("chat_id", chatId)
       .order("created_at", { ascending: false })
@@ -251,7 +241,7 @@ bot.on("message:text", async (ctx) => {
         
         // Delete the captcha from the database
         console.log(`Deleting captcha for user ${userId}`);
-        await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", chatId);
+        await supabase.from("captchas").delete().eq("id", data[0].id);
         console.log("Captcha deleted from database");
       } catch (error) {
         console.error("Error verifying captcha:", error);
@@ -265,8 +255,7 @@ bot.on("message:text", async (ctx) => {
       await supabase
         .from("captchas")
         .update({ attempts: attempts })
-        .eq("user_id", userId)
-        .eq("chat_id", chatId);
+        .eq("id", data[0].id);
       
       console.log(`Attempt ${attempts} of 3`);
       
@@ -283,7 +272,7 @@ bot.on("message:text", async (ctx) => {
           
           // Delete the captcha from the database
           console.log(`Deleting captcha for user ${userId}`);
-          await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", chatId);
+          await supabase.from("captchas").delete().eq("id", data[0].id);
           console.log("Captcha deleted from database");
         } catch (error) {
           console.error("Error kicking user:", error);
@@ -335,10 +324,11 @@ bot.on("message", async (ctx) => {
   }
 });
 
-// Handle new chat members via chat_member updates
+// Handle new chat members via chat_member updates - ENHANCED WITH DEBUGGING
 bot.on("chat_member", async (ctx) => {
   try {
     console.log("chat_member event received");
+    console.log("Full chat_member update:", JSON.stringify(ctx.update));
     
     // Safely check if required properties exist
     if (!ctx.chatMember || !ctx.chatMember.new_chat_member || !ctx.chatMember.new_chat_member.user) {
@@ -386,19 +376,37 @@ bot.on("chat_member", async (ctx) => {
         console.log(`User ${userId} restricted successfully`);
 
         // Store the captcha in the database with attempts field
-        console.log("Storing captcha in database");
-        const { data, error } = await supabase.from("captchas").insert({
-          user_id: userId,
-          chat_id: chatId,
-          captcha: captcha,
-          attempts: 0,
-          created_at: new Date().toISOString(),
-        });
-        
-        if (error) {
-          console.error("Database error:", error);
-        } else {
-          console.log("Captcha stored successfully");
+        console.log(`Attempting to store captcha in database: user_id=${userId}, chat_id=${chatId}, captcha=${captcha}`);
+        try {
+          const { data, error } = await supabase.from("captchas").insert({
+            user_id: userId,
+            chat_id: chatId,
+            captcha: captcha,
+            attempts: 0,
+            created_at: new Date().toISOString(),
+          });
+          
+          if (error) {
+            console.error("Database error when storing captcha:", error);
+            console.error("Error details:", JSON.stringify(error));
+          } else {
+            console.log("Captcha stored successfully, response:", JSON.stringify(data));
+            
+            // Verify the captcha was stored
+            const { data: verifyData, error: verifyError } = await supabase
+              .from("captchas")
+              .select("*")
+              .eq("user_id", userId)
+              .eq("chat_id", chatId);
+              
+            if (verifyError) {
+              console.error("Error verifying captcha storage:", verifyError);
+            } else {
+              console.log(`Verification found ${verifyData.length} captchas:`, JSON.stringify(verifyData));
+            }
+          }
+        } catch (dbError) {
+          console.error("Exception during database operation:", dbError);
         }
 
         // Send captcha message in the group
@@ -421,10 +429,11 @@ bot.on("chat_member", async (ctx) => {
   }
 });
 
-// Handle new chat members via message updates
+// Handle new chat members via message updates - ENHANCED WITH DEBUGGING
 bot.on("message:new_chat_members", async (ctx) => {
   try {
     console.log("new_chat_members event received");
+    console.log("Full new_chat_members update:", JSON.stringify(ctx.update));
     
     // Safely check if required properties exist
     if (!ctx.message || !ctx.message.new_chat_members || !ctx.chat || !ctx.me) {
@@ -464,21 +473,37 @@ bot.on("message:new_chat_members", async (ctx) => {
         console.log(`Successfully restricted user ${userId}`);
         
         // Store the captcha in the database with attempts field
-        console.log("Storing captcha in database");
-        const { data, error } = await supabase
-          .from("captchas")
-          .insert({
+        console.log(`Attempting to store captcha in database: user_id=${userId}, chat_id=${chatId}, captcha=${captcha}`);
+        try {
+          const { data, error } = await supabase.from("captchas").insert({
             user_id: userId,
             chat_id: chatId,
             captcha: captcha,
             attempts: 0,
             created_at: new Date().toISOString(),
           });
-        
-        if (error) {
-          console.error("Database error:", error);
-        } else {
-          console.log("Captcha stored successfully");
+          
+          if (error) {
+            console.error("Database error when storing captcha:", error);
+            console.error("Error details:", JSON.stringify(error));
+          } else {
+            console.log("Captcha stored successfully, response:", JSON.stringify(data));
+            
+            // Verify the captcha was stored
+            const { data: verifyData, error: verifyError } = await supabase
+              .from("captchas")
+              .select("*")
+              .eq("user_id", userId)
+              .eq("chat_id", chatId);
+              
+            if (verifyError) {
+              console.error("Error verifying captcha storage:", verifyError);
+            } else {
+              console.log(`Verification found ${verifyData.length} captchas:`, JSON.stringify(verifyData));
+            }
+          }
+        } catch (dbError) {
+          console.error("Exception during database operation:", dbError);
         }
         
         // Send captcha message in the group
@@ -592,6 +617,43 @@ module.exports = async (req, res) => {
 
   try {
     console.log("Received webhook request");
+
+    // Test database connection
+    console.log("Testing database connection");
+    try {
+      const { data, error } = await supabase.from("captchas").select("count").limit(1);
+      if (error) {
+        console.error("Database connection test failed:", error);
+      } else {
+        console.log("Database connection test successful:", data);
+      }
+    } catch (dbError) {
+      console.error("Exception during database test:", dbError);
+    }
+
+    // Test database insert
+    console.log("Testing database insert");
+    try {
+      const testCaptcha = {
+        user_id: 12345,
+        chat_id: 67890,
+        captcha: "TEST123",
+        attempts: 0,
+        created_at: new Date().toISOString()
+      };
+      
+      const { data, error } = await supabase.from("captchas").insert(testCaptcha);
+      if (error) {
+        console.error("Database insert test failed:", error);
+      } else {
+        console.log("Database insert test successful:", data);
+        
+        // Clean up the test record
+        await supabase.from("captchas").delete().eq("user_id", 12345).eq("chat_id", 67890);
+      }
+    } catch (dbError) {
+      console.error("Exception during database insert test:", dbError);
+    }
 
     // Parse the update safely
     let update;
