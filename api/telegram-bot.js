@@ -7,6 +7,11 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
+// Helper function for delayed execution
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // Initialize Supabase client with proper auth
 const supabaseUrl = process.env.SUPABASE_URL || "";
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
@@ -121,21 +126,29 @@ bot.on("message:text", async (ctx) => {
               console.error("Error getting chat info:", chatError);
             }
             
-            // Allow the user to send messages in the group
+            // First, notify the user that verification was successful
+            console.log("Sending initial success message to private chat");
+            await ctx.reply(addAttribution(`✅ Captcha verified successfully! You will gain access to ${chatTitle} in a few seconds.`));
+            
+            // Wait for 3 seconds before removing restrictions
+            console.log(`Waiting 3 seconds before removing restrictions for user ${userId}...`);
+            await delay(3000);
+            
+            // Now remove restrictions
             console.log(`Removing restrictions for user ${userId} in chat ${groupChatId}`);
             await ctx.api.restrictChatMember(groupChatId, userId, {
               permissions: {
                 can_send_messages: true,
                 can_send_media_messages: true,
                 can_send_other_messages: true,
-                can_add_web_page_previews: true,
-              },
+                can_add_web_page_previews: true
+              }
             });
             console.log(`Restrictions removed for user ${userId}`);
             
-            // Send success message to private chat
-            console.log("Sending success message to private chat");
-            await ctx.reply(addAttribution(`✅ Captcha verified successfully! You now have access to ${chatTitle}.`));
+            // Send a follow-up confirmation
+            console.log("Sending final success message to private chat");
+            await ctx.reply(addAttribution(`✅ You now have full access to ${chatTitle}!`));
             
             // Send success message to group
             console.log("Sending success message to group");
@@ -228,23 +241,30 @@ bot.on("message:text", async (ctx) => {
     console.log(`Comparing user input "${userInput}" with captcha "${captcha}"`);
     if (userInput === captcha) {
       // Correct captcha
-      console.log(`Captcha correct for user ${userId}`);
+      console.log(`Captcha correct for user ${userId}, waiting before removing restrictions...`);
       try {
-        // Allow the user to send messages
+        // First, notify the user that verification was successful
+        await ctx.reply(addAttribution(`✅ Captcha verified successfully! You will gain access to the group in a few seconds.`));
+        
+        // Wait for 3 seconds before removing restrictions
+        console.log(`Waiting 3 seconds before removing restrictions for user ${userId}...`);
+        await delay(3000);
+        
+        // Now remove restrictions
         console.log(`Removing restrictions for user ${userId}`);
         await ctx.api.restrictChatMember(chatId, userId, {
           permissions: {
             can_send_messages: true,
             can_send_media_messages: true,
             can_send_other_messages: true,
-            can_add_web_page_previews: true,
-          },
+            can_add_web_page_previews: true
+          }
         });
         console.log(`Restrictions removed for user ${userId}`);
         
         // Send success message
         console.log("Sending success message");
-        await ctx.reply(addAttribution(`✅ Captcha verified successfully! Welcome to the group.`));
+        await ctx.reply(addAttribution(`✅ You now have full access to the group!`));
         console.log("Success message sent");
         
         // Delete the captcha from the database
@@ -378,8 +398,8 @@ bot.on("chat_member", async (ctx) => {
             can_send_messages: false,
             can_send_media_messages: false,
             can_send_other_messages: false,
-            can_add_web_page_previews: false,
-          },
+            can_add_web_page_previews: false
+          }
         });
         console.log(`User ${userId} restricted successfully`);
 
@@ -482,8 +502,8 @@ bot.on("message:new_chat_members", async (ctx) => {
             can_send_messages: false,
             can_send_media_messages: false,
             can_send_other_messages: false,
-            can_add_web_page_previews: false,
-          },
+            can_add_web_page_previews: false
+          }
         });
         console.log(`Successfully restricted user ${userId}`);
         
@@ -612,6 +632,56 @@ RLS Test: ${testResult}
     console.error("Error in debug command:", error);
     if (ctx.chat) {
       await ctx.reply("Error retrieving debug info: " + error.message);
+    }
+  }
+});
+
+// Add a command to check bot permissions in a group
+bot.command("checkbot", async (ctx) => {
+  try {
+    console.log("Received /checkbot command");
+    
+    // Only process in group chats
+    if (!ctx.chat || (ctx.chat.type !== "group" && ctx.chat.type !== "supergroup")) {
+      await ctx.reply("This command only works in groups.");
+      return;
+    }
+    
+    const chatId = ctx.chat.id;
+    const botInfo = await ctx.api.getMe();
+    const botMember = await ctx.api.getChatMember(chatId, botInfo.id);
+    
+    console.log(`Bot permissions in chat ${chatId}:`, JSON.stringify(botMember));
+    
+    let permissionText = "Bot Permissions in this group:\n";
+    
+    if (botMember.status === "administrator") {
+      permissionText += "✅ Bot is an administrator\n\n";
+      
+      // Check specific permissions
+      const permissions = [
+        ["can_restrict_members", "Restrict members"],
+        ["can_delete_messages", "Delete messages"],
+        ["can_invite_users", "Invite users"]
+      ];
+      
+      for (const [perm, label] of permissions) {
+        permissionText += `${botMember[perm] ? "✅" : "❌"} ${label}\n`;
+      }
+      
+      if (!botMember.can_restrict_members) {
+        permissionText += "\n⚠️ The bot needs the 'Restrict members' permission to function properly!";
+      }
+    } else {
+      permissionText += "❌ Bot is NOT an administrator!\n\nPlease make the bot an administrator with the 'Restrict members' permission.";
+    }
+    
+    await ctx.reply(addAttribution(permissionText));
+    console.log("Sent permissions info");
+  } catch (error) {
+    console.error("Error in checkbot command:", error);
+    if (ctx.chat) {
+      await ctx.reply("Error checking permissions: " + error.message);
     }
   }
 });
