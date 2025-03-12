@@ -297,7 +297,9 @@ bot.on("message:text", async (ctx) => {
 });
 
 // Handle the /start command
-bot.on("command:start", async (ctx) => {
+bot.command("start", async (ctx) => {
+  // ...
+}); {
   try {
     console.log("Received /start command");
     await ctx.reply(
@@ -312,7 +314,9 @@ bot.on("command:start", async (ctx) => {
 });
 
 // Add debug command
-bot.on("command:debug", async (ctx) => {
+bot.command("debug", async (ctx) => {
+  // ...
+}); {
   try {
     console.log("Received /debug command");
     
