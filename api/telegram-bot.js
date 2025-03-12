@@ -390,6 +390,9 @@ module.exports = async (req, res) => {
     // Process the update
     if (update) {
       try {
+        // Initialize the bot before handling updates - THIS IS THE NEW LINE
+        await bot.init();
+        
         await bot.handleUpdate(update);
         console.log("Update processed successfully");
       } catch (error) {
