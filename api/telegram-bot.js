@@ -622,8 +622,12 @@ module.exports = async (req, res) => {
       console.log("New members:", JSON.stringify(update.message.new_chat_members));
     }
 
-    // Handle the update with error catching
+    // Initialize the bot before handling updates
     try {
+      // This is the key fix - initialize the bot before handling updates
+      await bot.init();
+      console.log("Bot initialized successfully");
+      
       await bot.handleUpdate(update);
       console.log("Update processed successfully");
     } catch (error) {
