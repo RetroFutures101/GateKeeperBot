@@ -20,9 +20,6 @@ const bot = new Bot(botToken);
 console.log(`Bot initialized with token: ${botToken ? "✓ Token exists" : "✗ No token found"}`);
 console.log(`Supabase initialized with URL: ${supabaseUrl ? "✓ URL exists" : "✗ No URL found"}`);
 
-// Map to store pending captchas for faster access
-const pendingCaptchas = new Map();
-
 // Initialize session
 bot.use(
   session({
@@ -48,21 +45,290 @@ function addAttribution(message) {
   return `${message}\n\n[created for you by POWERCITY.io](https://powercity.io)`;
 }
 
+// Handle text messages (captcha verification) - MUST BE REGISTERED BEFORE THE GENERAL MESSAGE HANDLER
+bot.on("message:text", async (ctx) => {
+  try {
+    // Safely check if required properties exist
+    if (!ctx.message || !ctx.message.text || !ctx.from || !ctx.chat) {
+      console.log("Missing required message:text properties");
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    const userInput = ctx.message.text.trim();
+    
+    console.log(`Received text message: "${userInput}" from user ${userId}`);
+    
+    // Check if this is a private chat
+    if (ctx.chat.type === "private") {
+      console.log("Message received in private chat, checking for captchas");
+      
+      // Check database for captchas for this user
+      console.log("Checking database for captchas");
+      const { data, error } = await supabase
+        .from("captchas")
+        .select("captcha, chat_id")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false });
+      
+      if (error) {
+        console.error("Database error when checking captcha:", error);
+        await ctx.reply("Sorry, there was an error checking your captcha. Please try again later.");
+        return;
+      }
+      
+      if (data && data.length > 0) {
+        console.log(`Found ${data.length} captchas in database for user ${userId}`);
+        let captchaVerified = false;
+        let groupChatId = null;
+        let captchaAttempts = 0;
+        
+        // Check if any of the captchas match the user input
+        for (const captchaRecord of data) {
+          console.log(`Comparing user input "${userInput}" with captcha "${captchaRecord.captcha}"`);
+          if (userInput === captchaRecord.captcha) {
+            captchaVerified = true;
+            groupChatId = captchaRecord.chat_id;
+            break;
+          } else {
+            captchaAttempts++;
+          }
+        }
+        
+        if (captchaVerified) {
+          // Correct captcha
+          console.log(`Captcha correct for user ${userId}`);
+          try {
+            // Get chat info to get the title
+            let chatTitle = "the group";
+            try {
+              const chatInfo = await ctx.api.getChat(groupChatId);
+              if (chatInfo && chatInfo.title) {
+                chatTitle = chatInfo.title;
+              }
+            } catch (chatError) {
+              console.error("Error getting chat info:", chatError);
+            }
+            
+            // Allow the user to send messages in the group
+            console.log(`Removing restrictions for user ${userId} in chat ${groupChatId}`);
+            await ctx.api.restrictChatMember(groupChatId, userId, {
+              permissions: {
+                can_send_messages: true,
+                can_send_media_messages: true,
+                can_send_other_messages: true,
+                can_add_web_page_previews: true,
+              },
+            });
+            console.log(`Restrictions removed for user ${userId}`);
+            
+            // Send success message to private chat
+            console.log("Sending success message to private chat");
+            await ctx.reply(addAttribution(`✅ Captcha verified successfully! You now have access to ${chatTitle}.`));
+            
+            // Send success message to group
+            console.log("Sending success message to group");
+            await ctx.api.sendMessage(
+              groupChatId,
+              addAttribution(`✅ @${ctx.from.username || ctx.from.first_name} has verified their captcha and can now participate in the group.`)
+            );
+            
+            // Delete the captcha from the database
+            console.log(`Deleting captcha for user ${userId}`);
+            await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", groupChatId);
+            
+            console.log("Captcha verification complete");
+            return;
+          } catch (error) {
+            console.error("Error verifying captcha:", error);
+            await ctx.reply("There was an error verifying your captcha. Please contact the group admin.");
+            return;
+          }
+        } else {
+          // Incorrect captcha
+          console.log(`Incorrect captcha for user ${userId}`);
+          
+          // Update attempts in database
+          const { data: attemptsData, error: attemptsError } = await supabase
+            .from("captchas")
+            .select("attempts")
+            .eq("user_id", userId)
+            .eq("chat_id", data[0].chat_id)
+            .single();
+          
+          let attempts = 1;
+          if (!attemptsError && attemptsData) {
+            attempts = (attemptsData.attempts || 0) + 1;
+          }
+          
+          // Update attempts in database
+          await supabase
+            .from("captchas")
+            .update({ attempts: attempts })
+            .eq("user_id", userId)
+            .eq("chat_id", data[0].chat_id);
+          
+          if (attempts >= 3) {
+            // Too many failed attempts, kick the user
+            console.log(`Too many failed attempts for user ${userId}, kicking from chat ${data[0].chat_id}`);
+            try {
+              await ctx.api.banChatMember(data[0].chat_id, userId);
+              await ctx.api.unbanChatMember(data[0].chat_id, userId); // Unban immediately to allow rejoining
+              console.log(`User ${userId} kicked and unbanned`);
+              
+              await ctx.reply(addAttribution(`❌ Too many failed attempts. You have been removed from the group. You can rejoin and try again if you wish.`));
+              
+              // Delete the captcha from the database
+              console.log(`Deleting captcha for user ${userId}`);
+              await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", data[0].chat_id);
+            } catch (error) {
+              console.error("Error kicking user:", error);
+              await ctx.reply("There was an error processing your captcha. Please contact the group admin.");
+            }
+          } else {
+            // Allow more attempts
+            console.log(`Sending incorrect captcha message, ${3 - attempts} attempts left`);
+            await ctx.reply(
+              addAttribution(`❌ Incorrect captcha. Please try again. You have ${3 - attempts} attempts left.`)
+            );
+          }
+          return;
+        }
+      } else {
+        console.log("No captcha found for user");
+        await ctx.reply("I don't have any pending captchas for you. If you were recently added to a group, please try again or contact the group admin.");
+        return;
+      }
+    }
+    
+    // If not a private chat, handle as before (for group messages)
+    const chatId = ctx.chat.id;
+
+    // Get the captcha from the database
+    console.log(`Checking for captcha for user ${userId} in chat ${chatId}`);
+    const { data, error } = await supabase
+      .from("captchas")
+      .select("captcha, attempts")
+      .eq("user_id", userId)
+      .eq("chat_id", chatId)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    
+    if (error) {
+      console.error("Database error when checking captcha:", error);
+      return;
+    }
+    
+    if (!data || data.length === 0) {
+      console.log(`No captcha found for user ${userId}`);
+      return;
+    }
+    
+    console.log(`Found captcha: ${data[0].captcha} for user ${userId}`);
+    const captcha = data[0].captcha;
+    
+    console.log(`Comparing user input "${userInput}" with captcha "${captcha}"`);
+    if (userInput === captcha) {
+      // Correct captcha
+      console.log(`Captcha correct for user ${userId}`);
+      try {
+        // Allow the user to send messages
+        console.log(`Removing restrictions for user ${userId}`);
+        await ctx.api.restrictChatMember(chatId, userId, {
+          permissions: {
+            can_send_messages: true,
+            can_send_media_messages: true,
+            can_send_other_messages: true,
+            can_add_web_page_previews: true,
+          },
+        });
+        console.log(`Restrictions removed for user ${userId}`);
+        
+        // Send success message
+        console.log("Sending success message");
+        await ctx.reply(addAttribution(`✅ Captcha verified successfully! Welcome to the group.`));
+        console.log("Success message sent");
+        
+        // Delete the captcha from the database
+        console.log(`Deleting captcha for user ${userId}`);
+        await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", chatId);
+        console.log("Captcha deleted from database");
+      } catch (error) {
+        console.error("Error verifying captcha:", error);
+      }
+    } else {
+      // Incorrect captcha
+      console.log(`Incorrect captcha for user ${userId}`);
+      
+      // Update attempts in database
+      const attempts = (data[0].attempts || 0) + 1;
+      await supabase
+        .from("captchas")
+        .update({ attempts: attempts })
+        .eq("user_id", userId)
+        .eq("chat_id", chatId);
+      
+      console.log(`Attempt ${attempts} of 3`);
+      
+      if (attempts >= 3) {
+        // Too many failed attempts, kick the user
+        console.log(`Too many failed attempts for user ${userId}, kicking`);
+        try {
+          await ctx.api.banChatMember(chatId, userId);
+          await ctx.api.unbanChatMember(chatId, userId); // Unban immediately to allow rejoining
+          console.log(`User ${userId} kicked and unbanned`);
+          
+          await ctx.reply(addAttribution(`❌ Too many failed attempts. Please rejoin the group and try again.`));
+          console.log("Kick message sent");
+          
+          // Delete the captcha from the database
+          console.log(`Deleting captcha for user ${userId}`);
+          await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", chatId);
+          console.log("Captcha deleted from database");
+        } catch (error) {
+          console.error("Error kicking user:", error);
+        }
+      } else {
+        // Allow more attempts
+        console.log(`Sending incorrect captcha message, ${3 - attempts} attempts left`);
+        await ctx.reply(
+          addAttribution(`❌ Incorrect captcha. Please try again. You have ${3 - attempts} attempts left.`),
+        );
+        console.log("Incorrect captcha message sent");
+      }
+    }
+  } catch (error) {
+    console.error("Error in message:text handler:", error);
+  }
+});
+
 // Add a simple message handler to test if the bot is working
 bot.on("message", async (ctx) => {
   try {
-    console.log("Received a message");
+    console.log("Received a message in general handler");
 
     // Safely check if text exists
     if (ctx.message && ctx.message.text) {
-      console.log(`Message text: ${ctx.message.text}`);
+      console.log(`Message text in general handler: ${ctx.message.text}`);
     } else {
       console.log("Message has no text");
     }
 
-    // Safely check chat type
+    // Only reply with the test message if it's not already handled by the message:text handler
+    // and it's a private chat with no pending captchas
     if (ctx.chat && ctx.chat.type === "private") {
-      await ctx.reply(addAttribution("I received your message! This confirms the webhook is working."));
+      // Check if there are pending captchas for this user
+      const userId = ctx.from.id;
+      const { data, error } = await supabase
+        .from("captchas")
+        .select("captcha")
+        .eq("user_id", userId)
+        .limit(1);
+      
+      if (error || !data || data.length === 0) {
+        // No captchas found, send the welcome message
+        await ctx.reply(addAttribution("I received your message! This confirms the webhook is working."));
+      }
     }
   } catch (error) {
     console.error("Error in message handler:", error);
@@ -119,12 +385,13 @@ bot.on("chat_member", async (ctx) => {
         });
         console.log(`User ${userId} restricted successfully`);
 
-        // Store the captcha in the database
+        // Store the captcha in the database with attempts field
         console.log("Storing captcha in database");
         const { data, error } = await supabase.from("captchas").insert({
           user_id: userId,
           chat_id: chatId,
           captcha: captcha,
+          attempts: 0,
           created_at: new Date().toISOString(),
         });
         
@@ -133,14 +400,6 @@ bot.on("chat_member", async (ctx) => {
         } else {
           console.log("Captcha stored successfully");
         }
-        
-        // Store in memory for quick access
-        pendingCaptchas.set(`${userId}:${chatId}`, {
-          captcha,
-          chatTitle,
-          attempts: 0,
-          timestamp: Date.now()
-        });
 
         // Send captcha message in the group
         console.log("Sending captcha message");
@@ -204,7 +463,7 @@ bot.on("message:new_chat_members", async (ctx) => {
         });
         console.log(`Successfully restricted user ${userId}`);
         
-        // Store the captcha in the database
+        // Store the captcha in the database with attempts field
         console.log("Storing captcha in database");
         const { data, error } = await supabase
           .from("captchas")
@@ -212,6 +471,7 @@ bot.on("message:new_chat_members", async (ctx) => {
             user_id: userId,
             chat_id: chatId,
             captcha: captcha,
+            attempts: 0,
             created_at: new Date().toISOString(),
           });
         
@@ -220,14 +480,6 @@ bot.on("message:new_chat_members", async (ctx) => {
         } else {
           console.log("Captcha stored successfully");
         }
-        
-        // Store in memory for quick access
-        pendingCaptchas.set(`${userId}:${chatId}`, {
-          captcha,
-          chatTitle,
-          attempts: 0,
-          timestamp: Date.now()
-        });
         
         // Send captcha message in the group
         console.log("Sending captcha message");
@@ -242,276 +494,6 @@ bot.on("message:new_chat_members", async (ctx) => {
     }
   } catch (error) {
     console.error("Error in new_chat_members handler:", error);
-  }
-});
-
-// Handle text messages (captcha verification)
-bot.on("message:text", async (ctx) => {
-  try {
-    // Safely check if required properties exist
-    if (!ctx.message || !ctx.message.text || !ctx.from || !ctx.chat) {
-      console.log("Missing required message:text properties");
-      return;
-    }
-    
-    const userId = ctx.from.id;
-    const userInput = ctx.message.text.trim();
-    
-    console.log(`Received text message: "${userInput}" from user ${userId}`);
-    
-    // Check if this is a private chat
-    if (ctx.chat.type === "private") {
-      console.log("Message received in private chat");
-      
-      // Check all pending captchas for this user
-      let captchaFound = false;
-      let captchaVerified = false;
-      let groupChatId = null;
-      let pendingCaptchaInfo = null;
-      
-      // First check memory cache for faster response
-      for (const [key, info] of pendingCaptchas.entries()) {
-        const [pendingUserId, pendingChatId] = key.split(':');
-        
-        if (parseInt(pendingUserId) === userId) {
-          captchaFound = true;
-          groupChatId = parseInt(pendingChatId);
-          pendingCaptchaInfo = info;
-          
-          console.log(`Found pending captcha in memory: ${info.captcha} for user ${userId} in chat ${groupChatId}`);
-          
-          if (userInput === info.captcha) {
-            captchaVerified = true;
-            break;
-          } else {
-            // Increment attempts
-            info.attempts++;
-            console.log(`Incorrect captcha attempt ${info.attempts} of 3`);
-            
-            if (info.attempts >= 3) {
-              // Too many failed attempts
-              break;
-            }
-          }
-        }
-      }
-      
-      // If not found in memory, check database
-      if (!captchaFound) {
-        console.log("Checking database for captchas");
-        const { data, error } = await supabase
-          .from("captchas")
-          .select("captcha, chat_id")
-          .eq("user_id", userId)
-          .order("created_at", { ascending: false });
-        
-        if (error) {
-          console.error("Database error when checking captcha:", error);
-          await ctx.reply("Sorry, there was an error checking your captcha. Please try again later.");
-          return;
-        }
-        
-        if (data && data.length > 0) {
-          captchaFound = true;
-          groupChatId = data[0].chat_id;
-          
-          console.log(`Found captcha in database: ${data[0].captcha} for user ${userId} in chat ${groupChatId}`);
-          
-          // Add to memory cache
-          if (!pendingCaptchas.has(`${userId}:${groupChatId}`)) {
-            pendingCaptchas.set(`${userId}:${groupChatId}`, {
-              captcha: data[0].captcha,
-              chatTitle: "the group", // We don't have the title from DB
-              attempts: 0,
-              timestamp: Date.now()
-            });
-            pendingCaptchaInfo = pendingCaptchas.get(`${userId}:${groupChatId}`);
-          }
-          
-          if (userInput === data[0].captcha) {
-            captchaVerified = true;
-          } else {
-            // Increment attempts
-            pendingCaptchaInfo.attempts++;
-            console.log(`Incorrect captcha attempt ${pendingCaptchaInfo.attempts} of 3`);
-            
-            if (pendingCaptchaInfo.attempts >= 3) {
-              // Too many failed attempts
-            }
-          }
-        }
-      }
-      
-      if (!captchaFound) {
-        console.log("No captcha found for user");
-        await ctx.reply("I don't have any pending captchas for you. If you were recently added to a group, please try again or contact the group admin.");
-        return;
-      }
-      
-      if (captchaVerified) {
-        // Correct captcha
-        console.log(`Captcha correct for user ${userId}`);
-        try {
-          // Allow the user to send messages in the group
-          console.log(`Removing restrictions for user ${userId} in chat ${groupChatId}`);
-          await ctx.api.restrictChatMember(groupChatId, userId, {
-            permissions: {
-              can_send_messages: true,
-              can_send_media_messages: true,
-              can_send_other_messages: true,
-              can_add_web_page_previews: true,
-            },
-          });
-          console.log(`Restrictions removed for user ${userId}`);
-          
-          // Send success message to private chat
-          console.log("Sending success message to private chat");
-          await ctx.reply(addAttribution(`✅ Captcha verified successfully! You now have access to ${pendingCaptchaInfo.chatTitle}.`));
-          
-          // Send success message to group
-          console.log("Sending success message to group");
-          await ctx.api.sendMessage(
-            groupChatId,
-            addAttribution(`✅ @${ctx.from.username || ctx.from.first_name} has verified their captcha and can now participate in the group.`)
-          );
-          
-          // Delete the captcha from the database
-          console.log(`Deleting captcha for user ${userId}`);
-          await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", groupChatId);
-          
-          // Remove from memory cache
-          pendingCaptchas.delete(`${userId}:${groupChatId}`);
-          
-          console.log("Captcha verification complete");
-        } catch (error) {
-          console.error("Error verifying captcha:", error);
-          await ctx.reply("There was an error verifying your captcha. Please contact the group admin.");
-        }
-      } else {
-        // Incorrect captcha
-        console.log(`Incorrect captcha for user ${userId}`);
-        
-        if (pendingCaptchaInfo.attempts >= 3) {
-          // Too many failed attempts, kick the user
-          console.log(`Too many failed attempts for user ${userId}, kicking from chat ${groupChatId}`);
-          try {
-            await ctx.api.banChatMember(groupChatId, userId);
-            await ctx.api.unbanChatMember(groupChatId, userId); // Unban immediately to allow rejoining
-            console.log(`User ${userId} kicked and unbanned`);
-            
-            await ctx.reply(addAttribution(`❌ Too many failed attempts. You have been removed from the group. You can rejoin and try again if you wish.`));
-            
-            // Delete the captcha from the database
-            console.log(`Deleting captcha for user ${userId}`);
-            await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", groupChatId);
-            
-            // Remove from memory cache
-            pendingCaptchas.delete(`${userId}:${groupChatId}`);
-          } catch (error) {
-            console.error("Error kicking user:", error);
-            await ctx.reply("There was an error processing your captcha. Please contact the group admin.");
-          }
-        } else {
-          // Allow more attempts
-          console.log(`Sending incorrect captcha message, ${3 - pendingCaptchaInfo.attempts} attempts left`);
-          await ctx.reply(
-            addAttribution(`❌ Incorrect captcha. Please try again. You have ${3 - pendingCaptchaInfo.attempts} attempts left.`)
-          );
-        }
-      }
-      return;
-    }
-    
-    // If not a private chat, handle as before (for group messages)
-    const chatId = ctx.chat.id;
-
-    // Get the captcha from the database
-    console.log(`Checking for captcha for user ${userId} in chat ${chatId}`);
-    const { data, error } = await supabase
-      .from("captchas")
-      .select("captcha")
-      .eq("user_id", userId)
-      .eq("chat_id", chatId)
-      .order("created_at", { ascending: false })
-      .limit(1);
-    
-    if (error) {
-      console.error("Database error when checking captcha:", error);
-      return;
-    }
-    
-    if (!data || data.length === 0) {
-      console.log(`No captcha found for user ${userId}`);
-      return;
-    }
-    
-    console.log(`Found captcha: ${data[0].captcha} for user ${userId}`);
-    const captcha = data[0].captcha;
-    
-    console.log(`Comparing user input "${userInput}" with captcha "${captcha}"`);
-    if (userInput === captcha) {
-      // Correct captcha
-      console.log(`Captcha correct for user ${userId}`);
-      try {
-        // Allow the user to send messages
-        console.log(`Removing restrictions for user ${userId}`);
-        await ctx.api.restrictChatMember(chatId, userId, {
-          permissions: {
-            can_send_messages: true,
-            can_send_media_messages: true,
-            can_send_other_messages: true,
-            can_add_web_page_previews: true,
-          },
-        });
-        console.log(`Restrictions removed for user ${userId}`);
-        
-        // Send success message
-        console.log("Sending success message");
-        await ctx.reply(addAttribution(`✅ Captcha verified successfully! Welcome to the group.`));
-        console.log("Success message sent");
-        
-        // Delete the captcha from the database
-        console.log(`Deleting captcha for user ${userId}`);
-        await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", chatId);
-        console.log("Captcha deleted from database");
-      } catch (error) {
-        console.error("Error verifying captcha:", error);
-      }
-    } else {
-      // Incorrect captcha
-      console.log(`Incorrect captcha for user ${userId}`);
-      ctx.session.attempts++;
-      console.log(`Attempt ${ctx.session.attempts} of 3`);
-      
-      if (ctx.session.attempts >= 3) {
-        // Too many failed attempts, kick the user
-        console.log(`Too many failed attempts for user ${userId}, kicking`);
-        try {
-          await ctx.api.banChatMember(chatId, userId);
-          await ctx.api.unbanChatMember(chatId, userId); // Unban immediately to allow rejoining
-          console.log(`User ${userId} kicked and unbanned`);
-          
-          await ctx.reply(addAttribution(`❌ Too many failed attempts. Please rejoin the group and try again.`));
-          console.log("Kick message sent");
-          
-          // Delete the captcha from the database
-          console.log(`Deleting captcha for user ${userId}`);
-          await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", chatId);
-          console.log("Captcha deleted from database");
-        } catch (error) {
-          console.error("Error kicking user:", error);
-        }
-      } else {
-        // Allow more attempts
-        console.log(`Sending incorrect captcha message, ${3 - ctx.session.attempts} attempts left`);
-        await ctx.reply(
-          addAttribution(`❌ Incorrect captcha. Please try again. You have ${3 - ctx.session.attempts} attempts left.`),
-        );
-        console.log("Incorrect captcha message sent");
-      }
-    }
-  } catch (error) {
-    console.error("Error in message:text handler:", error);
   }
 });
 
@@ -548,6 +530,21 @@ bot.command("debug", async (ctx) => {
     const chatMember = await ctx.api.getChatMember(chatId, botInfo.id);
     console.log(`Chat member info: ${JSON.stringify(chatMember)}`);
 
+    // Check for pending captchas for this user
+    let captchasInfo = "";
+    if (ctx.from) {
+      const { data, error } = await supabase
+        .from("captchas")
+        .select("*")
+        .eq("user_id", ctx.from.id);
+      
+      if (!error && data && data.length > 0) {
+        captchasInfo = `\nPending Captchas: ${data.length}\n${data.map(c => `Chat ID: ${c.chat_id}, Captcha: ${c.captcha}, Attempts: ${c.attempts || 0}`).join("\n")}`;
+      } else {
+        captchasInfo = "\nNo pending captchas found for you.";
+      }
+    }
+
     await ctx.reply(
       addAttribution(`Debug Info:
 Bot ID: ${botInfo.id}
@@ -555,6 +552,7 @@ Bot Username: ${botInfo.username}
 Chat ID: ${chatId}
 Bot Status in Chat: ${chatMember.status}
 Bot Permissions: ${JSON.stringify(chatMember)}
+${captchasInfo}
       `),
     );
     console.log("Sent debug info");
