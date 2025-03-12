@@ -1,83 +1,73 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
-import { Bot, GrammyError, HttpError, session } from "https://deno.land/x/grammy@v1.14.1/mod.ts"
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1"
+const { Bot, session } = require("grammy");
+const { createClient } = require("@supabase/supabase-js");
 
 // CORS headers for public access
-export const corsHeaders = {
+const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-}
+};
 
 // Initialize Supabase client
-const supabaseUrl = Deno.env.get("SUPABASE_URL") || ""
-const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
-const supabase = createClient(supabaseUrl, supabaseKey)
+const supabaseUrl = process.env.SUPABASE_URL || "";
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Initialize Telegram bot
-const botToken = Deno.env.get("TELEGRAM_BOT_TOKEN") || ""
-const bot = new Bot(botToken)
+const botToken = process.env.TELEGRAM_BOT_TOKEN || "";
+const bot = new Bot(botToken);
 
 // Log bot initialization
-console.log(`Bot initialized with token: ${botToken ? "✓ Token exists" : "✗ No token found"}`)
-console.log(`Supabase initialized with URL: ${supabaseUrl ? "✓ URL exists" : "✗ No URL found"}`)
+console.log(`Bot initialized with token: ${botToken ? "✓ Token exists" : "✗ No token found"}`);
+console.log(`Supabase initialized with URL: ${supabaseUrl ? "✓ URL exists" : "✗ No URL found"}`);
 
 // Map to store pending captchas for faster access
 const pendingCaptchas = new Map();
 
-// Define session interface
-interface SessionData {
-  captcha: string
-  attempts: number
-  chatId?: number
-}
-
 // Initialize session
 bot.use(
   session({
-    initial: (): SessionData => ({
+    initial: () => ({
       captcha: "",
       attempts: 0,
     }),
-  }),
-)
+  })
+);
 
 // Generate a random 6-digit alphanumerical captcha
-function generateCaptcha(): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-  let result = ""
+function generateCaptcha() {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let result = "";
   for (let i = 0; i < 6; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length))
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
   }
-  return result
+  return result;
 }
 
 // Add the attribution footer to messages
-function addAttribution(message: string): string {
-  return `${message}
-
-[created for you by POWERCITY.io](https://powercity.io)`
+function addAttribution(message) {
+  return `${message}\n\n[created for you by POWERCITY.io](https://powercity.io)`;
 }
 
 // Add a simple message handler to test if the bot is working
 bot.on("message", async (ctx) => {
   try {
-    console.log("Received a message")
+    console.log("Received a message");
 
     // Safely check if text exists
-    if (ctx.message.text) {
-      console.log(`Message text: ${ctx.message.text}`)
+    if (ctx.message && ctx.message.text) {
+      console.log(`Message text: ${ctx.message.text}`);
     } else {
-      console.log("Message has no text")
+      console.log("Message has no text");
     }
 
     // Safely check chat type
     if (ctx.chat && ctx.chat.type === "private") {
-      await ctx.reply(addAttribution("I received your message! This confirms the webhook is working."))
+      await ctx.reply(addAttribution("I received your message! This confirms the webhook is working."));
     }
   } catch (error) {
-    console.error("Error in message handler:", error)
+    console.error("Error in message handler:", error);
   }
-})
+});
 
 // Handle new chat members via chat_member updates
 bot.on("chat_member", async (ctx) => {
@@ -528,35 +518,35 @@ bot.on("message:text", async (ctx) => {
 // Handle the /start command
 bot.command("start", async (ctx) => {
   try {
-    console.log("Received /start command")
+    console.log("Received /start command");
     await ctx.reply(
       addAttribution(
         "👋 Hello! I'm a captcha bot that helps protect groups from spam.\n\nAdd me to a group and grant me admin privileges to get started.",
       ),
-    )
-    console.log("Sent start message")
+    );
+    console.log("Sent start message");
   } catch (error) {
-    console.error("Error in start command handler:", error)
+    console.error("Error in start command handler:", error);
   }
-})
+});
 
 // Add debug command
 bot.command("debug", async (ctx) => {
   try {
-    console.log("Received /debug command")
+    console.log("Received /debug command");
 
     // Safely check if chat exists
     if (!ctx.chat) {
-      console.log("ctx.chat is undefined in debug command")
-      return
+      console.log("ctx.chat is undefined in debug command");
+      return;
     }
 
-    const chatId = ctx.chat.id
-    const botInfo = await ctx.api.getMe()
-    console.log(`Bot info: ${JSON.stringify(botInfo)}`)
+    const chatId = ctx.chat.id;
+    const botInfo = await ctx.api.getMe();
+    console.log(`Bot info: ${JSON.stringify(botInfo)}`);
 
-    const chatMember = await ctx.api.getChatMember(chatId, botInfo.id)
-    console.log(`Chat member info: ${JSON.stringify(chatMember)}`)
+    const chatMember = await ctx.api.getChatMember(chatId, botInfo.id);
+    console.log(`Chat member info: ${JSON.stringify(chatMember)}`);
 
     await ctx.reply(
       addAttribution(`Debug Info:
@@ -566,83 +556,83 @@ Chat ID: ${chatId}
 Bot Status in Chat: ${chatMember.status}
 Bot Permissions: ${JSON.stringify(chatMember)}
       `),
-    )
-    console.log("Sent debug info")
+    );
+    console.log("Sent debug info");
   } catch (error) {
-    console.error("Error in debug command:", error)
+    console.error("Error in debug command:", error);
     if (ctx.chat) {
-      await ctx.reply("Error retrieving debug info: " + error.message)
+      await ctx.reply("Error retrieving debug info: " + error.message);
     }
   }
-})
+});
 
 // Handle errors
 bot.catch((err) => {
   try {
-    const ctx = err.ctx
-    console.error(`Error while handling update ${ctx.update.update_id}:`)
-    const e = err.error
-    if (e instanceof GrammyError) {
-      console.error("Error in request:", e.description)
-    } else if (e instanceof HttpError) {
-      console.error("Could not contact Telegram:", e)
+    const ctx = err.ctx;
+    console.error(`Error while handling update ${ctx.update.update_id}:`);
+    const e = err.error;
+    if (e instanceof Error) {
+      console.error("Error:", e.message);
     } else {
-      console.error("Unknown error:", e)
+      console.error("Unknown error:", e);
     }
   } catch (error) {
-    console.error("Error in error handler:", error)
+    console.error("Error in error handler:", error);
   }
-})
+});
 
-// Start the bot with enhanced logging and error handling
-const handleUpdate = async (req: Request) => {
+// Handle webhook requests
+module.exports = async (req, res) => {
   // Handle CORS preflight requests
   if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders })
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "authorization, x-client-info, apikey, content-type");
+    res.status(200).send("OK");
+    return;
   }
 
   try {
-    console.log("Received webhook request")
+    console.log("Received webhook request");
 
     // Parse the update safely
-    let update
+    let update;
     try {
-      update = await req.json()
-      console.log("Update payload:", JSON.stringify(update))
+      update = req.body;
+      console.log("Update payload:", JSON.stringify(update));
     } catch (error) {
-      console.error("Error parsing update JSON:", error)
-      return new Response("Bad Request: Invalid JSON", { status: 400, headers: corsHeaders })
+      console.error("Error parsing update JSON:", error);
+      res.status(400).send("Bad Request: Invalid JSON");
+      return;
     }
 
     // Check update type for debugging
     if (update.chat_member) {
-      console.log("Detected chat_member update")
+      console.log("Detected chat_member update");
       if (update.chat_member.new_chat_member) {
-        console.log("New member status:", update.chat_member.new_chat_member.status)
+        console.log("New member status:", update.chat_member.new_chat_member.status);
         if (update.chat_member.new_chat_member.user) {
-          console.log("User info:", JSON.stringify(update.chat_member.new_chat_member.user))
+          console.log("User info:", JSON.stringify(update.chat_member.new_chat_member.user));
         }
       }
     }
 
     if (update.message && update.message.new_chat_members && update.message.new_chat_members.length > 0) {
-      console.log("Detected new_chat_members via message")
-      console.log("New members:", JSON.stringify(update.message.new_chat_members))
+      console.log("Detected new_chat_members via message");
+      console.log("New members:", JSON.stringify(update.message.new_chat_members));
     }
 
     // Handle the update with error catching
     try {
-      await bot.handleUpdate(update)
-      console.log("Update processed successfully")
+      await bot.handleUpdate(update);
+      console.log("Update processed successfully");
     } catch (error) {
-      console.error("Error in bot.handleUpdate:", error)
+      console.error("Error in bot.handleUpdate:", error);
     }
+
+    res.status(200).send("OK");
   } catch (err) {
-    console.error("Error processing update:", err)
+    console.error("Error processing update:", err);
+    res.status(500).send("Internal Server Error");
   }
-
-  return new Response("OK", { headers: corsHeaders })
-}
-
-// Deno variable is provided by the Deno runtime, no need to declare it.
-serve(handleUpdate)
+};
