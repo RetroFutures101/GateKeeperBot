@@ -121,10 +121,72 @@ async function unrestrict(api, chatId, userId) {
       console.log("Method 3 failed:", error.message);
     }
     
+    // Fourth approach: Try promoteChatMember
+    console.log("Method 4: Using promoteChatMember");
+    try {
+      await api.promoteChatMember(chatId, userId, {
+        can_send_messages: true,
+        can_send_media_messages: true,
+        can_send_other_messages: true,
+        can_add_web_page_previews: true
+      });
+      console.log("Method 4 succeeded");
+    } catch (error) {
+      console.log("Method 4 failed:", error.message);
+    }
+    
     console.log("All unrestriction methods attempted");
     return true;
   } catch (error) {
     console.error("Error in unrestrict function:", error);
+    return false;
+  }
+}
+
+// Function to store captcha in database with upsert
+async function storeCaptcha(userId, chatId, captcha) {
+  console.log(`Attempting to store captcha in database: user_id=${userId}, chat_id=${chatId}, captcha=${captcha}`);
+  
+  try {
+    // First, try to delete any existing captcha for this user in this chat
+    console.log(`Checking for existing captcha for user ${userId} in chat ${chatId}`);
+    const { error: deleteError } = await supabase
+      .from("captchas")
+      .delete()
+      .eq("user_id", userId)
+      .eq("chat_id", chatId);
+    
+    if (deleteError) {
+      console.error("Error deleting existing captcha:", deleteError);
+    } else {
+      console.log("Successfully deleted any existing captcha entries");
+    }
+    
+    // Now insert the new captcha
+    const captchaData = {
+      user_id: userId,
+      chat_id: chatId,
+      captcha: captcha,
+      attempts: 0,
+      created_at: new Date().toISOString(),
+    };
+    
+    console.log("Captcha data to insert:", JSON.stringify(captchaData));
+    
+    const { data, error } = await supabase
+      .from("captchas")
+      .insert(captchaData);
+    
+    if (error) {
+      console.error("Database error when storing captcha:", error);
+      console.error("Error details:", JSON.stringify(error));
+      return false;
+    } else {
+      console.log("Captcha stored successfully, response:", JSON.stringify(data));
+      return true;
+    }
+  } catch (error) {
+    console.error("Exception during captcha storage:", error);
     return false;
   }
 }
@@ -473,31 +535,10 @@ bot.on("chat_member", async (ctx) => {
       const captcha = generateCaptcha();
       console.log(`Generated captcha: ${captcha} for user ${userId}`);
       
-      // Store the captcha in the database with attempts field
-      console.log(`Attempting to store captcha in database: user_id=${userId}, chat_id=${chatId}, captcha=${captcha}`);
-      try {
-        // Explicitly disable RLS for this operation
-        const captchaData = {
-          user_id: userId,
-          chat_id: chatId,
-          captcha: captcha,
-          attempts: 0,
-          created_at: new Date().toISOString(),
-        };
-        
-        console.log("Captcha data to insert:", JSON.stringify(captchaData));
-        
-        const { data, error } = await supabase
-          .from("captchas")
-          .insert(captchaData);
-        
-        if (error) {
-          console.error("Database error when storing captcha:", error);
-          console.error("Error details:", JSON.stringify(error));
-        } else {
-          console.log("Captcha stored successfully, response:", JSON.stringify(data));
-        }
-        
+      // Store the captcha in the database with attempts field - using the new function
+      const stored = await storeCaptcha(userId, chatId, captcha);
+      
+      if (stored) {
         // Send captcha message in the group
         console.log("Sending captcha message");
         await ctx.api.sendMessage(
@@ -507,8 +548,8 @@ bot.on("chat_member", async (ctx) => {
           ),
         );
         console.log("Captcha message sent successfully");
-      } catch (error) {
-        console.error("Error generating captcha:", error);
+      } else {
+        console.error("Failed to store captcha, not sending message");
       }
     } 
     // Also handle new members joining
@@ -533,43 +574,22 @@ bot.on("chat_member", async (ctx) => {
         });
         console.log(`User ${userId} restricted successfully`);
 
-        // Store the captcha in the database with attempts field
-        console.log(`Attempting to store captcha in database: user_id=${userId}, chat_id=${chatId}, captcha=${captcha}`);
-        try {
-          // Explicitly disable RLS for this operation
-          const captchaData = {
-            user_id: userId,
-            chat_id: chatId,
-            captcha: captcha,
-            attempts: 0,
-            created_at: new Date().toISOString(),
-          };
-          
-          console.log("Captcha data to insert:", JSON.stringify(captchaData));
-          
-          const { data, error } = await supabase
-            .from("captchas")
-            .insert(captchaData);
-          
-          if (error) {
-            console.error("Database error when storing captcha:", error);
-            console.error("Error details:", JSON.stringify(error));
-          } else {
-            console.log("Captcha stored successfully, response:", JSON.stringify(data));
-          }
-        } catch (dbError) {
-          console.error("Exception during database operation:", dbError);
+        // Store the captcha in the database with attempts field - using the new function
+        const stored = await storeCaptcha(userId, chatId, captcha);
+        
+        if (stored) {
+          // Send captcha message in the group
+          console.log("Sending captcha message");
+          await ctx.api.sendMessage(
+            chatId,
+            addAttribution(
+              `Welcome, ${member.user.first_name}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
+            ),
+          );
+          console.log("Captcha message sent successfully");
+        } else {
+          console.error("Failed to store captcha, not sending message");
         }
-
-        // Send captcha message in the group
-        console.log("Sending captcha message");
-        await ctx.api.sendMessage(
-          chatId,
-          addAttribution(
-            `Welcome, ${member.user.first_name}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
-          ),
-        );
-        console.log("Captcha message sent successfully");
       } catch (error) {
         console.error("Error handling new member:", error);
       }
@@ -624,41 +644,20 @@ bot.on("message:new_chat_members", async (ctx) => {
         });
         console.log(`Successfully restricted user ${userId}`);
         
-        // Store the captcha in the database with attempts field
-        console.log(`Attempting to store captcha in database: user_id=${userId}, chat_id=${chatId}, captcha=${captcha}`);
-        try {
-          // Explicitly disable RLS for this operation
-          const captchaData = {
-            user_id: userId,
-            chat_id: chatId,
-            captcha: captcha,
-            attempts: 0,
-            created_at: new Date().toISOString(),
-          };
-          
-          console.log("Captcha data to insert:", JSON.stringify(captchaData));
-          
-          const { data, error } = await supabase
-            .from("captchas")
-            .insert(captchaData);
-          
-          if (error) {
-            console.error("Database error when storing captcha:", error);
-            console.error("Error details:", JSON.stringify(error));
-          } else {
-            console.log("Captcha stored successfully, response:", JSON.stringify(data));
-          }
-        } catch (dbError) {
-          console.error("Exception during database operation:", dbError);
-        }
+        // Store the captcha in the database with attempts field - using the new function
+        const stored = await storeCaptcha(userId, chatId, captcha);
         
-        // Send captcha message in the group
-        console.log("Sending captcha message");
-        await ctx.api.sendMessage(
-          chatId,
-          addAttribution(`Welcome, ${member.first_name}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`)
-        );
-        console.log("Captcha message sent successfully");
+        if (stored) {
+          // Send captcha message in the group
+          console.log("Sending captcha message");
+          await ctx.api.sendMessage(
+            chatId,
+            addAttribution(`Welcome, ${member.first_name}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`)
+          );
+          console.log("Captcha message sent successfully");
+        } else {
+          console.error("Failed to store captcha, not sending message");
+        }
       } catch (error) {
         console.error(`Error handling new member ${userId}:`, error);
       }
@@ -835,6 +834,56 @@ bot.command("unrestrict", async (ctx) => {
     }
   } catch (error) {
     console.error("Error in unrestrict command:", error);
+    if (ctx.chat) {
+      await ctx.reply("Error processing command: " + error.message);
+    }
+  }
+});
+
+// Add a command to clear captchas for a user
+bot.command("clearcaptcha", async (ctx) => {
+  try {
+    console.log("Received /clearcaptcha command");
+    
+    // Only process in group chats
+    if (!ctx.chat || (ctx.chat.type !== "group" && ctx.chat.type !== "supergroup")) {
+      await ctx.reply("This command only works in groups.");
+      return;
+    }
+    
+    // Check if the command is a reply to a message
+    if (!ctx.message || !ctx.message.reply_to_message) {
+      await ctx.reply("Please use this command as a reply to a message from the user whose captcha you want to clear.");
+      return;
+    }
+    
+    const targetUserId = ctx.message.reply_to_message.from.id;
+    const chatId = ctx.chat.id;
+    
+    console.log(`Attempting to clear captcha for user ${targetUserId} in chat ${chatId}`);
+    
+    // Check if the user is an admin
+    const senderMember = await ctx.api.getChatMember(chatId, ctx.from.id);
+    if (senderMember.status !== "administrator" && senderMember.status !== "creator") {
+      await ctx.reply("Only administrators can use this command.");
+      return;
+    }
+    
+    // Delete captcha from database
+    const { error } = await supabase
+      .from("captchas")
+      .delete()
+      .eq("user_id", targetUserId)
+      .eq("chat_id", chatId);
+    
+    if (error) {
+      console.error("Error clearing captcha:", error);
+      await ctx.reply("❌ Failed to clear captcha: " + error.message);
+    } else {
+      await ctx.reply("✅ Captcha cleared successfully!");
+    }
+  } catch (error) {
+    console.error("Error in clearcaptcha command:", error);
     if (ctx.chat) {
       await ctx.reply("Error processing command: " + error.message);
     }
