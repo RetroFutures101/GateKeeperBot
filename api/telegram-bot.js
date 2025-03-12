@@ -56,6 +56,66 @@ function addAttribution(message) {
   return `${message}\n\n[created for you by POWERCITY.io](https://powercity.io)`;
 }
 
+// Function to unrestrict a user with multiple approaches
+async function unrestrict(api, chatId, userId) {
+  console.log(`Attempting to unrestrict user ${userId} in chat ${chatId} using multiple methods`);
+  
+  try {
+    // First approach: Simple permission object
+    console.log("Method 1: Using simple permission object");
+    await api.restrictChatMember(chatId, userId, {
+      can_send_messages: true,
+      can_send_media_messages: true,
+      can_send_other_messages: true,
+      can_add_web_page_previews: true
+    });
+    
+    // Wait a moment between methods
+    await delay(1000);
+    
+    // Second approach: Using the full permission object
+    console.log("Method 2: Using full permission object");
+    await api.restrictChatMember(chatId, userId, {
+      permissions: {
+        can_send_messages: true,
+        can_send_media_messages: true,
+        can_send_other_messages: true,
+        can_add_web_page_previews: true
+      }
+    });
+    
+    // Wait a moment between methods
+    await delay(1000);
+    
+    // Third approach: Try promoteChatMember with minimal permissions
+    console.log("Method 3: Using promoteChatMember");
+    try {
+      await api.promoteChatMember(chatId, userId, {
+        can_change_info: false,
+        can_post_messages: false,
+        can_edit_messages: false,
+        can_delete_messages: false,
+        can_invite_users: true,
+        can_restrict_members: false,
+        can_pin_messages: false,
+        can_promote_members: false,
+        can_manage_chat: false,
+        can_manage_video_chats: false
+      });
+      console.log("promoteChatMember succeeded");
+    } catch (promoteError) {
+      console.log("promoteChatMember failed (this is normal if user is not an admin):", promoteError.message);
+      // This is expected to fail for regular users, so we continue
+    }
+    
+    console.log("All unrestriction methods attempted");
+    return true;
+  } catch (error) {
+    console.error("Error in unrestrict function:", error);
+    return false;
+  }
+}
+
 // Handle text messages (captcha verification) - MUST BE REGISTERED BEFORE THE GENERAL MESSAGE HANDLER
 bot.on("message:text", async (ctx) => {
   try {
@@ -134,34 +194,33 @@ bot.on("message:text", async (ctx) => {
             console.log(`Waiting 3 seconds before removing restrictions for user ${userId}...`);
             await delay(3000);
             
-            // Now remove restrictions
+            // Now remove restrictions using multiple methods
             console.log(`Removing restrictions for user ${userId} in chat ${groupChatId}`);
-            await ctx.api.restrictChatMember(groupChatId, userId, {
-              permissions: {
-                can_send_messages: true,
-                can_send_media_messages: true,
-                can_send_other_messages: true,
-                can_add_web_page_previews: true
-              }
-            });
-            console.log(`Restrictions removed for user ${userId}`);
+            const success = await unrestrict(ctx.api, groupChatId, userId);
             
-            // Send a follow-up confirmation
-            console.log("Sending final success message to private chat");
-            await ctx.reply(addAttribution(`✅ You now have full access to ${chatTitle}!`));
-            
-            // Send success message to group
-            console.log("Sending success message to group");
-            await ctx.api.sendMessage(
-              groupChatId,
-              addAttribution(`✅ @${ctx.from.username || ctx.from.first_name} has verified their captcha and can now participate in the group.`)
-            );
-            
-            // Delete the captcha from the database
-            console.log(`Deleting captcha for user ${userId}`);
-            await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", groupChatId);
-            
-            console.log("Captcha verification complete");
+            if (success) {
+              console.log(`Restrictions removed for user ${userId}`);
+              
+              // Send a follow-up confirmation
+              console.log("Sending final success message to private chat");
+              await ctx.reply(addAttribution(`✅ You now have full access to ${chatTitle}!`));
+              
+              // Send success message to group
+              console.log("Sending success message to group");
+              await ctx.api.sendMessage(
+                groupChatId,
+                addAttribution(`✅ @${ctx.from.username || ctx.from.first_name} has verified their captcha and can now participate in the group.`)
+              );
+              
+              // Delete the captcha from the database
+              console.log(`Deleting captcha for user ${userId}`);
+              await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", groupChatId);
+              
+              console.log("Captcha verification complete");
+            } else {
+              console.error("Failed to remove restrictions");
+              await ctx.reply("There was an error removing restrictions. Please contact the group admin.");
+            }
             return;
           } catch (error) {
             console.error("Error verifying captcha:", error);
@@ -250,27 +309,26 @@ bot.on("message:text", async (ctx) => {
         console.log(`Waiting 3 seconds before removing restrictions for user ${userId}...`);
         await delay(3000);
         
-        // Now remove restrictions
+        // Now remove restrictions using multiple methods
         console.log(`Removing restrictions for user ${userId}`);
-        await ctx.api.restrictChatMember(chatId, userId, {
-          permissions: {
-            can_send_messages: true,
-            can_send_media_messages: true,
-            can_send_other_messages: true,
-            can_add_web_page_previews: true
-          }
-        });
-        console.log(`Restrictions removed for user ${userId}`);
+        const success = await unrestrict(ctx.api, chatId, userId);
         
-        // Send success message
-        console.log("Sending success message");
-        await ctx.reply(addAttribution(`✅ You now have full access to the group!`));
-        console.log("Success message sent");
-        
-        // Delete the captcha from the database
-        console.log(`Deleting captcha for user ${userId}`);
-        await supabase.from("captchas").delete().eq("id", data[0].id);
-        console.log("Captcha deleted from database");
+        if (success) {
+          console.log(`Restrictions removed for user ${userId}`);
+          
+          // Send success message
+          console.log("Sending success message");
+          await ctx.reply(addAttribution(`✅ You now have full access to the group!`));
+          console.log("Success message sent");
+          
+          // Delete the captcha from the database
+          console.log(`Deleting captcha for user ${userId}`);
+          await supabase.from("captchas").delete().eq("id", data[0].id);
+          console.log("Captcha deleted from database");
+        } else {
+          console.error("Failed to remove restrictions");
+          await ctx.reply("There was an error removing restrictions. Please contact the group admin.");
+        }
       } catch (error) {
         console.error("Error verifying captcha:", error);
       }
@@ -682,6 +740,57 @@ bot.command("checkbot", async (ctx) => {
     console.error("Error in checkbot command:", error);
     if (ctx.chat) {
       await ctx.reply("Error checking permissions: " + error.message);
+    }
+  }
+});
+
+// Add a command to manually unrestrict a user
+bot.command("unrestrict", async (ctx) => {
+  try {
+    console.log("Received /unrestrict command");
+    
+    // Only process in group chats
+    if (!ctx.chat || (ctx.chat.type !== "group" && ctx.chat.type !== "supergroup")) {
+      await ctx.reply("This command only works in groups.");
+      return;
+    }
+    
+    // Check if the command is a reply to a message
+    if (!ctx.message || !ctx.message.reply_to_message) {
+      await ctx.reply("Please use this command as a reply to a message from the user you want to unrestrict.");
+      return;
+    }
+    
+    const targetUserId = ctx.message.reply_to_message.from.id;
+    const chatId = ctx.chat.id;
+    
+    console.log(`Attempting to manually unrestrict user ${targetUserId} in chat ${chatId}`);
+    
+    // Check if the user is an admin
+    const senderMember = await ctx.api.getChatMember(chatId, ctx.from.id);
+    if (senderMember.status !== "administrator" && senderMember.status !== "creator") {
+      await ctx.reply("Only administrators can use this command.");
+      return;
+    }
+    
+    // Try to unrestrict the user
+    try {
+      await ctx.reply("Attempting to unrestrict user...");
+      const success = await unrestrict(ctx.api, chatId, targetUserId);
+      
+      if (success) {
+        await ctx.reply("✅ User has been unrestricted successfully!");
+      } else {
+        await ctx.reply("❌ Failed to unrestrict user. Please check bot permissions.");
+      }
+    } catch (error) {
+      console.error("Error in unrestrict command:", error);
+      await ctx.reply(`Error: ${error.message}`);
+    }
+  } catch (error) {
+    console.error("Error in unrestrict command:", error);
+    if (ctx.chat) {
+      await ctx.reply("Error processing command: " + error.message);
     }
   }
 });
