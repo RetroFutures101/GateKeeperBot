@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "description": "Telegram bot that requires users to complete a captcha to enter a group",
   "main": "api/telegram-bot.js",
-  "type": "module",
   "scripts": {
     "dev": "vercel dev",
     "deploy": "vercel deploy --prod"
