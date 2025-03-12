@@ -31,6 +31,9 @@ console.log(`Bot initialized with token: ${botToken ? "✓ Token exists" : "✗ 
 console.log(`Supabase initialized with URL: ${supabaseUrl ? "✓ URL exists" : "✗ No URL found"}`);
 console.log(`Supabase key: ${supabaseKey ? supabaseKey.substring(0, 5) + "..." : "✗ No key found"}`);
 
+// Track recently verified users to prevent re-restriction loops
+const verifiedUsers = new Map();
+
 // Initialize session
 bot.use(
   session({
@@ -54,6 +57,26 @@ function generateCaptcha() {
 // Add the attribution footer to messages
 function addAttribution(message) {
   return `${message}\n\n[created for you by POWERCITY.io](https://powercity.io)`;
+}
+
+// Function to check if a user was recently verified
+function isRecentlyVerified(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  return verifiedUsers.has(key);
+}
+
+// Function to mark a user as verified
+function markUserAsVerified(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  verifiedUsers.set(key, Date.now());
+  
+  // Remove from verified list after 5 minutes to allow future captchas if needed
+  setTimeout(() => {
+    verifiedUsers.delete(key);
+    console.log(`Removed user ${userId} from verified list for chat ${chatId}`);
+  }, 5 * 60 * 1000); // 5 minutes
+  
+  console.log(`Marked user ${userId} as verified in chat ${chatId}`);
 }
 
 // Function to unrestrict a user with multiple approaches
@@ -135,6 +158,9 @@ async function unrestrict(api, chatId, userId) {
       console.log("Method 4 failed:", error.message);
     }
     
+    // Mark the user as verified to prevent re-restriction loops
+    markUserAsVerified(userId, chatId);
+    
     console.log("All unrestriction methods attempted");
     return true;
   } catch (error) {
@@ -187,6 +213,72 @@ async function storeCaptcha(userId, chatId, captcha) {
     }
   } catch (error) {
     console.error("Exception during captcha storage:", error);
+    return false;
+  }
+}
+
+// Function to check if a user has a verified status in the database
+async function checkVerifiedStatus(userId, chatId) {
+  try {
+    // Check if we have a record in the verified_users table
+    const { data, error } = await supabase
+      .from("verified_users")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("chat_id", chatId)
+      .single();
+    
+    if (error && error.code !== "PGRST116") { // PGRST116 is "no rows returned" which is fine
+      console.error("Error checking verified status:", error);
+      return false;
+    }
+    
+    return data ? true : false;
+  } catch (error) {
+    console.error("Exception checking verified status:", error);
+    return false;
+  }
+}
+
+// Function to mark a user as verified in the database
+async function storeVerifiedStatus(userId, chatId) {
+  try {
+    // First check if the record already exists
+    const { data: existingData, error: checkError } = await supabase
+      .from("verified_users")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("chat_id", chatId);
+    
+    if (checkError) {
+      console.error("Error checking existing verified status:", checkError);
+      return false;
+    }
+    
+    // If record exists, we're done
+    if (existingData && existingData.length > 0) {
+      console.log(`User ${userId} already marked as verified in chat ${chatId}`);
+      return true;
+    }
+    
+    // Otherwise insert a new record
+    const { error } = await supabase
+      .from("verified_users")
+      .insert({
+        user_id: userId,
+        chat_id: chatId,
+        verified_at: new Date().toISOString()
+      });
+    
+    if (error) {
+      console.error("Error storing verified status:", error);
+      return false;
+    }
+    
+    console.log(`Stored verified status for user ${userId} in chat ${chatId}`);
+    return true;
+  } catch (error) {
+    console.error("Exception storing verified status:", error);
     return false;
   }
 }
@@ -275,6 +367,9 @@ bot.on("message:text", async (ctx) => {
             
             if (success) {
               console.log(`Restrictions removed for user ${userId}`);
+              
+              // Mark user as verified in the database
+              await storeVerifiedStatus(userId, groupChatId);
               
               // Send a follow-up confirmation
               console.log("Sending final success message to private chat");
@@ -390,6 +485,9 @@ bot.on("message:text", async (ctx) => {
         
         if (success) {
           console.log(`Restrictions removed for user ${userId}`);
+          
+          // Mark user as verified in the database
+          await storeVerifiedStatus(userId, chatId);
           
           // Send success message
           console.log("Sending success message");
@@ -529,6 +627,26 @@ bot.on("chat_member", async (ctx) => {
         (!oldMember || oldMember.status !== "restricted" || 
          (oldMember.can_send_messages && !member.can_send_messages))) {
       
+      // Check if this user was recently verified to prevent re-restriction loops
+      if (isRecentlyVerified(userId, chatId)) {
+        console.log(`User ${userId} was recently verified, ignoring restriction`);
+        
+        // Try to unrestrict the user again
+        console.log(`Attempting to unrestrict recently verified user ${userId}`);
+        await unrestrict(ctx.api, chatId, userId);
+        return;
+      }
+      
+      // Check if user is already verified in the database
+      const isVerified = await checkVerifiedStatus(userId, chatId);
+      if (isVerified) {
+        console.log(`User ${userId} is verified in database, unrestricting without captcha`);
+        
+        // Try to unrestrict the user
+        await unrestrict(ctx.api, chatId, userId);
+        return;
+      }
+      
       console.log(`User ${userId} was restricted, generating captcha`);
       
       // Generate a new captcha
@@ -556,6 +674,13 @@ bot.on("chat_member", async (ctx) => {
     else if (member.status === "member" && (!oldMember || oldMember.status !== "member")) {
       // New member joined
       console.log(`New member joined: ${member.user.first_name} (${member.user.id})`);
+      
+      // Check if this user is already verified
+      const isVerified = await checkVerifiedStatus(userId, chatId);
+      if (isVerified) {
+        console.log(`User ${userId} is already verified, not generating captcha`);
+        return;
+      }
       
       // Generate a new captcha
       const captcha = generateCaptcha();
@@ -626,6 +751,13 @@ bot.on("message:new_chat_members", async (ctx) => {
       const userId = member.id;
       const chatId = ctx.chat.id;
       const chatTitle = ctx.chat.title || "the group";
+      
+      // Check if this user is already verified
+      const isVerified = await checkVerifiedStatus(userId, chatId);
+      if (isVerified) {
+        console.log(`User ${userId} is already verified, not generating captcha`);
+        continue;
+      }
       
       // Generate a new captcha
       const captcha = generateCaptcha();
@@ -715,6 +847,17 @@ bot.command("debug", async (ctx) => {
       }
     }
 
+    // Check verified status
+    let verifiedInfo = "";
+    if (ctx.from) {
+      const isVerified = await checkVerifiedStatus(ctx.from.id, chatId);
+      verifiedInfo = `\nVerified Status: ${isVerified ? "✅ Verified" : "❌ Not Verified"}`;
+      
+      // Also check in-memory verification
+      const isRecentlyVerifiedInMemory = isRecentlyVerified(ctx.from.id, chatId);
+      verifiedInfo += `\nRecently Verified (in-memory): ${isRecentlyVerifiedInMemory ? "✅ Yes" : "❌ No"}`;
+    }
+
     // Test RLS bypass
     const testResult = await testRLS();
 
@@ -726,6 +869,7 @@ Chat ID: ${chatId}
 Bot Status in Chat: ${chatMember.status}
 Bot Permissions: ${JSON.stringify(chatMember)}
 ${captchasInfo}
+${verifiedInfo}
 
 RLS Test: ${testResult}
       `),
@@ -824,7 +968,9 @@ bot.command("unrestrict", async (ctx) => {
       const success = await unrestrict(ctx.api, chatId, targetUserId);
       
       if (success) {
-        await ctx.reply("✅ User has been unrestricted successfully!");
+        // Mark user as verified in the database
+        await storeVerifiedStatus(targetUserId, chatId);
+        await ctx.reply("✅ User has been unrestricted successfully and marked as verified!");
       } else {
         await ctx.reply("❌ Failed to unrestrict user. Please check bot permissions.");
       }
@@ -884,6 +1030,51 @@ bot.command("clearcaptcha", async (ctx) => {
     }
   } catch (error) {
     console.error("Error in clearcaptcha command:", error);
+    if (ctx.chat) {
+      await ctx.reply("Error processing command: " + error.message);
+    }
+  }
+});
+
+// Add a command to mark a user as verified
+bot.command("verify", async (ctx) => {
+  try {
+    console.log("Received /verify command");
+    
+    // Only process in group chats
+    if (!ctx.chat || (ctx.chat.type !== "group" && ctx.chat.type !== "supergroup")) {
+      await ctx.reply("This command only works in groups.");
+      return;
+    }
+    
+    // Check if the command is a reply to a message
+    if (!ctx.message || !ctx.message.reply_to_message) {
+      await ctx.reply("Please use this command as a reply to a message from the user you want to mark as verified.");
+      return;
+    }
+    
+    const targetUserId = ctx.message.reply_to_message.from.id;
+    const chatId = ctx.chat.id;
+    
+    console.log(`Attempting to mark user ${targetUserId} as verified in chat ${chatId}`);
+    
+    // Check if the user is an admin
+    const senderMember = await ctx.api.getChatMember(chatId, ctx.from.id);
+    if (senderMember.status !== "administrator" && senderMember.status !== "creator") {
+      await ctx.reply("Only administrators can use this command.");
+      return;
+    }
+    
+    // Mark user as verified
+    const success = await storeVerifiedStatus(targetUserId, chatId);
+    
+    if (success) {
+      await ctx.reply("✅ User has been marked as verified!");
+    } else {
+      await ctx.reply("❌ Failed to mark user as verified.");
+    }
+  } catch (error) {
+    console.error("Error in verify command:", error);
     if (ctx.chat) {
       await ctx.reply("Error processing command: " + error.message);
     }
