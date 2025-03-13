@@ -1447,9 +1447,6 @@ RLS Test: ${testResult}
 bot.command("checkbot", async (ctx) => {
   try {
     console.log("Received /checkbot command");
-      async (ctx) => {
-  try {
-    console.log("Received /checkbot command");
     
     // Only process in group chats
     if (!ctx.chat || (ctx.chat.type !== "group" && ctx.chat.type !== "supergroup")) {
@@ -1770,4 +1767,3 @@ module.exports = async (req, res) => {
     res.status(500).send("Internal Server Error");
   }
 };
-
