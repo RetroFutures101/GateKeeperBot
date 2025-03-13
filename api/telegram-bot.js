@@ -92,21 +92,35 @@ function isRecentlyVerified(userId, chatId) {
 // Function to check if a user is in grace period
 function isInGracePeriod(userId, chatId) {
   const key = `${userId}:${chatId}`;
-  return graceUsers.has(key);
+  const inGrace = graceUsers.has(key);
+  console.log(`GRACE CHECK: User ${userId} in chat ${chatId} is in grace period: ${inGrace}`);
+  if (inGrace) {
+    const timestamp = graceUsers.get(key);
+    const elapsedMs = Date.now() - timestamp;
+    const remainingSecs = Math.max(0, Math.floor((GRACE_PERIOD - elapsedMs) / 1000));
+    console.log(`GRACE INFO: ${remainingSecs} seconds remaining in grace period`);
+  }
+  return inGrace;
 }
 
 // Function to mark a user as in grace period
 function markUserInGracePeriod(userId, chatId) {
   const key = `${userId}:${chatId}`;
-  graceUsers.set(key, Date.now());
+  const now = Date.now();
+  graceUsers.set(key, now);
+
+  console.log(`GRACE PERIOD: Marked user ${userId} as in grace period for chat ${chatId} at ${new Date(now).toISOString()}`);
+  console.log(`GRACE PERIOD: Will expire at ${new Date(now + GRACE_PERIOD).toISOString()}`);
 
   // Remove from grace period after the specified time
   setTimeout(() => {
-    graceUsers.delete(key);
-    console.log(`Removed user ${userId} from grace period for chat ${chatId}`);
+    if (graceUsers.get(key) === now) { // Only delete if it's the same timestamp (no newer grace period was set)
+      graceUsers.delete(key);
+      console.log(`GRACE PERIOD: Removed user ${userId} from grace period for chat ${chatId}`);
+    } else {
+      console.log(`GRACE PERIOD: Not removing user ${userId} from grace period as it was updated`);
+    }
   }, GRACE_PERIOD);
-
-  console.log(`Marked user ${userId} as in grace period for chat ${chatId}`);
 }
 
 // Function to mark a user as permanently verified (after sending a message)
@@ -411,6 +425,14 @@ async function restrictUser(api, chatId, userId) {
     return false;
   }
 
+  // ENHANCED LOGGING: Log all verification statuses for debugging
+  console.log(`RESTRICT CHECK: Verification status for user ${userId} in chat ${chatId}:`);
+  console.log(`- Permanently verified: ${isPermanentlyVerified(userId, chatId)}`);
+  console.log(`- Recently verified: ${isRecentlyVerified(userId, chatId)}`);
+  console.log(`- Unrestricted by bot: ${wasUnrestrictedByBot(userId, chatId)}`);
+  console.log(`- Memory verified: ${memoryVerifiedUsers.has(`${userId}:${chatId}`)}`);
+  console.log(`- In grace period: ${isInGracePeriod(userId, chatId)}`);
+
   // NEW: Check if user is permanently verified
   if (isPermanentlyVerified(userId, chatId)) {
     console.log(`User ${userId} is permanently verified, not restricting`);
@@ -419,7 +441,7 @@ async function restrictUser(api, chatId, userId) {
 
   // NEW: Check if user is in grace period
   if (isInGracePeriod(userId, chatId)) {
-    console.log(`User ${userId} is in grace period, not restricting`);
+    console.log(`GRACE PROTECTION: User ${userId} is in grace period, not restricting`);
     return false;
   }
 
@@ -667,7 +689,7 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
 
   // NEW: Check if user is in grace period
   if (isInGracePeriod(userId, chatId)) {
-    console.log(`User ${userId} is in grace period, not generating captcha`);
+    console.log(`GRACE PROTECTION: User ${userId} is in grace period, not generating captcha`);
     
     // Ensure they're unrestricted
     await unrestrict(ctx.api, chatId, userId);
@@ -789,6 +811,7 @@ async function verifyCaptchaAndUnrestrict(ctx, userId, groupChatId, captchaRecor
     
     // NEW: Mark user as in grace period
     markUserInGracePeriod(userId, groupChatId);
+    console.log(`VERIFICATION: User ${userId} marked as in grace period for chat ${groupChatId}`);
 
     // Remove from pending captchas
     markAsNotHavingPendingCaptcha(userId, groupChatId);
@@ -962,7 +985,7 @@ bot.on("message:text", async (ctx) => {
 
     // NEW: Check if user is in grace period and mark as permanently verified if they send a message
     if (isInGracePeriod(userId, chatId)) {
-      console.log(`User ${userId} sent a message during grace period, marking as permanently verified`);
+      console.log(`GRACE PERIOD MESSAGE: User ${userId} sent a message during grace period, marking as permanently verified`);
       markUserAsPermanentlyVerified(userId, chatId);
       
       // Also store in database for persistence
@@ -1062,7 +1085,7 @@ bot.on("message", async (ctx) => {
 
     // NEW: Check if user is in grace period and mark as permanently verified if they send a message
     if (ctx.from && ctx.chat && ctx.chat.type !== "private" && isInGracePeriod(ctx.from.id, ctx.chat.id)) {
-      console.log(`User ${ctx.from.id} sent a message during grace period, marking as permanently verified`);
+      console.log(`GRACE PERIOD MESSAGE: User ${ctx.from.id} sent a message during grace period, marking as permanently verified`);
       markUserAsPermanentlyVerified(ctx.from.id, ctx.chat.id);
       
       // Also store in database for persistence
@@ -1163,7 +1186,7 @@ bot.on("chat_member", async (ctx) => {
     
     // NEW: Check if user is in grace period
     if (isInGracePeriod(userId, chatId)) {
-      console.log(`User ${userId} is in grace period, ignoring restriction`);
+      console.log(`GRACE PROTECTION: User ${userId} is in grace period, ignoring restriction`);
       
       // If they're restricted, try to unrestrict them immediately
       if (member.status === "restricted" && (!member.can_send_messages || !member.can_send_media_messages)) {
@@ -1422,6 +1445,9 @@ RLS Test: ${testResult}
 
 // Add a command to check bot permissions in a group
 bot.command("checkbot", async (ctx) => {
+  try {
+    console.log("Received /checkbot command");
+      async (ctx) => {
   try {
     console.log("Received /checkbot command");
     
@@ -1744,3 +1770,4 @@ module.exports = async (req, res) => {
     res.status(500).send("Internal Server Error");
   }
 };
+
