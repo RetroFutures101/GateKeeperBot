@@ -39,6 +39,8 @@ const processingUsers = new Map();
 const restrictedByBot = new Map();
 // Track users who have been unrestricted by the bot
 const unrestrictedByBot = new Map();
+// Track users who have failed database verification but are verified in memory
+const memoryVerifiedUsers = new Map();
 
 // Initialize session
 bot.use(
@@ -68,7 +70,7 @@ function addAttribution(message) {
 // Function to check if a user was recently verified
 function isRecentlyVerified(userId, chatId) {
   const key = `${userId}:${chatId}`;
-  return verifiedUsers.has(key);
+  return verifiedUsers.has(key) || memoryVerifiedUsers.has(key);
 }
 
 // Function to mark a user as verified
@@ -76,13 +78,27 @@ function markUserAsVerified(userId, chatId) {
   const key = `${userId}:${chatId}`;
   verifiedUsers.set(key, Date.now());
   
-  // Remove from verified list after 60 minutes to allow future captchas if needed
+  // Remove from verified list after 24 hours to allow future captchas if needed
   setTimeout(() => {
     verifiedUsers.delete(key);
     console.log(`Removed user ${userId} from verified list for chat ${chatId}`);
-  }, 60 * 60 * 1000); // 60 minutes
+  }, 24 * 60 * 60 * 1000); // 24 hours
   
   console.log(`Marked user ${userId} as verified in chat ${chatId}`);
+}
+
+// Function to mark a user as verified in memory only (fallback when database fails)
+function markUserAsMemoryVerified(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  memoryVerifiedUsers.set(key, Date.now());
+  
+  // Keep this record for a long time (7 days) since we can't rely on the database
+  setTimeout(() => {
+    memoryVerifiedUsers.delete(key);
+    console.log(`Removed user ${userId} from memory-verified list for chat ${chatId}`);
+  }, 7 * 24 * 60 * 60 * 1000); // 7 days
+  
+  console.log(`Marked user ${userId} as memory-verified in chat ${chatId}`);
 }
 
 // Function to check if a user is being processed
@@ -137,11 +153,11 @@ function markAsUnrestrictedByBot(userId, chatId) {
   const key = `${userId}:${chatId}`;
   unrestrictedByBot.set(key, Date.now());
   
-  // Keep this record for a longer time (2 hours) to prevent re-restriction loops
+  // Keep this record for a longer time (24 hours) to prevent re-restriction loops
   setTimeout(() => {
     unrestrictedByBot.delete(key);
     console.log(`Removed user ${userId} from unrestricted-by-bot list for chat ${chatId}`);
-  }, 2 * 60 * 60 * 1000); // 2 hours
+  }, 24 * 60 * 60 * 1000); // 24 hours
   
   console.log(`Marked user ${userId} as unrestricted by bot in chat ${chatId}`);
 }
@@ -163,15 +179,21 @@ async function unrestrict(api, chatId, userId) {
     // Mark the user as unrestricted by the bot
     markAsUnrestrictedByBot(userId, chatId);
     
+    // Also mark as memory-verified as a fallback
+    markUserAsMemoryVerified(userId, chatId);
+    
     // Store verified status in database - with better error handling
     try {
-      await storeVerifiedStatus(userId, chatId);
+      const dbSuccess = await storeVerifiedStatus(userId, chatId);
+      if (!dbSuccess) {
+        console.log("Database verification failed, relying on memory verification");
+      }
     } catch (dbError) {
       console.error("Error storing verified status in database:", dbError);
       // Continue anyway, we'll rely on in-memory verification
     }
     
-    // First approach: Simple permission object (old style)
+    // APPROACH 1: Using a simpler permission object
     console.log("Method 1: Using simple permission object (old style)");
     try {
       await api.restrictChatMember(chatId, userId, {
@@ -188,7 +210,7 @@ async function unrestrict(api, chatId, userId) {
     // Wait a moment between methods
     await delay(1000);
     
-    // Second approach: Using the full permission object
+    // APPROACH 2: Using the full permission object
     console.log("Method 2: Using full permission object");
     try {
       await api.restrictChatMember(chatId, userId, {
@@ -207,7 +229,7 @@ async function unrestrict(api, chatId, userId) {
     // Wait a moment between methods
     await delay(1000);
     
-    // Third approach: Using the comprehensive permission object
+    // Using the comprehensive permission object
     console.log("Method 3: Using comprehensive permission object");
     try {
       await api.restrictChatMember(chatId, userId, {
@@ -234,7 +256,7 @@ async function unrestrict(api, chatId, userId) {
     // Wait a moment between methods
     await delay(1000);
     
-    // Fourth approach: Try promoteChatMember
+    // APPROACH 3: Try promoteChatMember
     console.log("Method 4: Using promoteChatMember");
     try {
       await api.promoteChatMember(chatId, userId, {
@@ -352,6 +374,8 @@ async function storeVerifiedStatus(userId, chatId) {
     
     if (checkError) {
       console.error("Error checking existing verified status:", checkError);
+      // Mark as memory-verified as a fallback
+      markUserAsMemoryVerified(userId, chatId);
       return false;
     }
     
@@ -363,16 +387,21 @@ async function storeVerifiedStatus(userId, chatId) {
     
     // Otherwise insert a new record
     console.log(`Storing verified status for user ${userId} in chat ${chatId}`);
+    
+    // Try with explicit RLS bypass headers
     const { error } = await supabase
       .from("verified_users")
       .insert({
         user_id: userId,
         chat_id: chatId,
         verified_at: new Date().toISOString()
-      });
+      })
+      .select();
     
     if (error) {
       console.error("Error storing verified status:", error);
+      // Mark as memory-verified as a fallback
+      markUserAsMemoryVerified(userId, chatId);
       return false;
     }
     
@@ -380,6 +409,8 @@ async function storeVerifiedStatus(userId, chatId) {
     return true;
   } catch (error) {
     console.error("Exception storing verified status:", error);
+    // Mark as memory-verified as a fallback
+    markUserAsMemoryVerified(userId, chatId);
     return false;
   }
 }
@@ -469,7 +500,9 @@ bot.on("message:text", async (ctx) => {
             
             // Mark the user as verified BEFORE removing restrictions
             markUserAsVerified(userId, groupChatId);
+            markUserAsMemoryVerified(userId, groupChatId);
             
+            // Try to store in database, but continue even if it fails
             try {
               await storeVerifiedStatus(userId, groupChatId);
             } catch (dbError) {
@@ -617,7 +650,9 @@ bot.on("message:text", async (ctx) => {
         
         // Mark the user as verified BEFORE removing restrictions
         markUserAsVerified(userId, chatId);
+        markUserAsMemoryVerified(userId, chatId);
         
+        // Try to store in database, but continue even if it fails
         try {
           await storeVerifiedStatus(userId, chatId);
         } catch (dbError) {
@@ -775,21 +810,23 @@ bot.on("chat_member", async (ctx) => {
     
     console.log(`Processing chat_member event for user ${userId} with status ${member.status}`);
     
+    // CRITICAL CHECK: If this user was recently verified or unrestricted by the bot, don't restrict them again
+    if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId)) {
+      console.log(`User ${userId} is verified or was unrestricted by bot, ignoring chat_member event`);
+      
+      // If they're restricted, try to unrestrict them again
+      if (member.status === "restricted" && !member.can_send_messages) {
+        console.log(`User ${userId} is verified but restricted, unrestricting again`);
+        await unrestrict(ctx.api, chatId, userId);
+      }
+      
+      return;
+    }
+    
     // Check if the user was just restricted (either by this bot or another admin)
     if (member.status === "restricted" && 
         (!oldMember || oldMember.status !== "restricted" || 
          (oldMember.can_send_messages && !member.can_send_messages))) {
-      
-      // CRITICAL FIX: Check if this user was recently verified or unrestricted by the bot
-      // This is the key to preventing re-restriction loops
-      if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId)) {
-        console.log(`User ${userId} was recently verified or unrestricted, ignoring restriction and unrestricting again`);
-        
-        // Try to unrestrict the user again immediately
-        console.log(`Attempting to unrestrict recently verified user ${userId}`);
-        await unrestrict(ctx.api, chatId, userId);
-        return;
-      }
       
       // Check if user is already verified in the database
       const isVerified = await checkVerifiedStatus(userId, chatId);
@@ -1070,8 +1107,11 @@ bot.command("debug", async (ctx) => {
       const isVerifiedInDb = await checkVerifiedStatus(ctx.from.id, chatId);
       const isRecentlyVerifiedInMemory = isRecentlyVerified(ctx.from.id, chatId);
       const isUnrestrictedByBot = wasUnrestrictedByBot(ctx.from.id, chatId);
+      const isMemoryVerified = memoryVerifiedUsers.has(`${ctx.from.id}:${chatId}`);
+      
       verifiedInfo = `\nVerified Status: ${isVerifiedInDb ? "✅ Verified in DB" : "❌ Not Verified in DB"}`;
       verifiedInfo += `\nRecently Verified (in-memory): ${isRecentlyVerifiedInMemory ? "✅ Yes" : "❌ No"}`;
+      verifiedInfo += `\nMemory-only Verified: ${isMemoryVerified ? "✅ Yes" : "❌ No"}`;
       verifiedInfo += `\nUnrestricted By Bot: ${isUnrestrictedByBot ? "✅ Yes" : "❌ No"}`;
       
       // Check if being processed
