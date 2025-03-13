@@ -1377,15 +1377,45 @@ async function testRLS() {
   try {
     console.log("Testing RLS bypass");
     
+    // Use a random ID to avoid duplicate key errors
+    const randomId = Math.floor(Math.random() * 1000000) + 1000000;
+    
     // Test insert
     const testData = {
-      user_id: 999999,
-      chat_id: 999999,
+      user_id: randomId,
+      chat_id: randomId,
       captcha: "RLSTEST",
       attempts: 0,
       created_at: new Date().toISOString()
     };
     
+    // First check if the test data already exists
+    const { data: existingData, error: checkError } = await supabase
+      .from("captchas")
+      .select("id")
+      .eq("user_id", randomId)
+      .eq("chat_id", randomId);
+      
+    if (checkError) {
+      console.error("RLS test check failed:", checkError);
+      return `Check failed: ${checkError.message}`;
+    }
+    
+    // If test data already exists, delete it first
+    if (existingData && existingData.length > 0) {
+      const { error: deleteError } = await supabase
+        .from("captchas")
+        .delete()
+        .eq("user_id", randomId)
+        .eq("chat_id", randomId);
+        
+      if (deleteError) {
+        console.error("RLS test cleanup failed:", deleteError);
+        return `Cleanup failed: ${deleteError.message}`;
+      }
+    }
+    
+    // Now insert the test data
     const { data: insertData, error: insertError } = await supabase
       .from("captchas")
       .insert(testData);
@@ -1401,8 +1431,8 @@ async function testRLS() {
     const { error: deleteError } = await supabase
       .from("captchas")
       .delete()
-      .eq("user_id", 999999)
-      .eq("chat_id", 999999);
+      .eq("user_id", randomId)
+      .eq("chat_id", randomId);
     
     if (deleteError) {
       console.error("RLS test cleanup failed:", deleteError);
