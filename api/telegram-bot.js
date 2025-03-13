@@ -43,6 +43,10 @@ const unrestrictedByBot = new Map();
 const memoryVerifiedUsers = new Map();
 // Track users who are currently being restricted to prevent race conditions
 const restrictingUsers = new Map();
+// Track users who are currently being unrestricted to prevent race conditions
+const unrestrictingUsers = new Map();
+// Track users who have pending captchas
+const pendingCaptchas = new Map();
 
 // Initialize session
 bot.use(
@@ -157,6 +161,60 @@ function markAsNotBeingRestricted(userId, chatId) {
   console.log(`Removed user ${userId} from restricting list for chat ${chatId}`);
 }
 
+// Function to check if a user is currently being unrestricted
+function isBeingUnrestricted(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  return unrestrictingUsers.has(key);
+}
+
+// Function to mark a user as being unrestricted
+function markAsBeingUnrestricted(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  unrestrictingUsers.set(key, Date.now());
+  
+  // Remove from unrestricting list after 30 seconds to prevent deadlocks
+  setTimeout(() => {
+    unrestrictingUsers.delete(key);
+    console.log(`Removed user ${userId} from unrestricting list for chat ${chatId}`);
+  }, 30 * 1000); // 30 seconds
+  
+  console.log(`Marked user ${userId} as being unrestricted in chat ${chatId}`);
+}
+
+// Function to mark a user as no longer being unrestricted
+function markAsNotBeingUnrestricted(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  unrestrictingUsers.delete(key);
+  console.log(`Removed user ${userId} from unrestricting list for chat ${chatId}`);
+}
+
+// Function to check if a user has a pending captcha
+function hasPendingCaptcha(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  return pendingCaptchas.has(key);
+}
+
+// Function to mark a user as having a pending captcha
+function markAsHavingPendingCaptcha(userId, chatId, captcha) {
+  const key = `${userId}:${chatId}`;
+  pendingCaptchas.set(key, captcha);
+  
+  // Remove from pending captchas list after 1 hour
+  setTimeout(() => {
+    pendingCaptchas.delete(key);
+    console.log(`Removed user ${userId} from pending captchas list for chat ${chatId}`);
+  }, 60 * 60 * 1000); // 1 hour
+  
+  console.log(`Marked user ${userId} as having pending captcha in chat ${chatId}`);
+}
+
+// Function to mark a user as no longer having a pending captcha
+function markAsNotHavingPendingCaptcha(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  pendingCaptchas.delete(key);
+  console.log(`Removed user ${userId} from pending captchas list for chat ${chatId}`);
+}
+
 // Function to mark a user as restricted by the bot
 function markAsRestrictedByBot(userId, chatId) {
   const key = `${userId}:${chatId}`;
@@ -201,7 +259,16 @@ function wasUnrestrictedByBot(userId, chatId) {
 async function unrestrict(api, chatId, userId) {
   console.log(`Attempting to unrestrict user ${userId} in chat ${chatId} using multiple methods`);
   
+  // Check if already being unrestricted to prevent race conditions
+  if (isBeingUnrestricted(userId, chatId)) {
+    console.log(`User ${userId} is already being unrestricted, skipping duplicate unrestriction`);
+    return true;
+  }
+  
   try {
+    // Mark as being unrestricted to prevent concurrent operations
+    markAsBeingUnrestricted(userId, chatId);
+    
     // Mark the user as verified BEFORE unrestricting to prevent re-restriction loops
     markUserAsVerified(userId, chatId);
     
@@ -296,10 +363,15 @@ async function unrestrict(api, chatId, userId) {
       console.log("Method 4 failed:", error.message);
     }
     
+    // Mark as no longer being unrestricted
+    markAsNotBeingUnrestricted(userId, chatId);
+    
     console.log("All unrestriction methods attempted");
     return true;
   } catch (error) {
     console.error("Error in unrestrict function:", error);
+    // Mark as no longer being unrestricted
+    markAsNotBeingUnrestricted(userId, chatId);
     return false;
   }
 }
@@ -327,21 +399,45 @@ async function restrictUser(api, chatId, userId) {
     // Mark that this restriction was done by the bot
     markAsRestrictedByBot(userId, chatId);
     
-    // Perform the restriction
-    await api.restrictChatMember(chatId, userId, {
-      permissions: {
-        can_send_messages: false,
-        can_send_media_messages: false,
-        can_send_other_messages: false,
-        can_add_web_page_previews: false
-      }
-    });
+    // Try multiple restriction approaches
+    let restrictionSucceeded = false;
     
-    console.log(`Successfully restricted user ${userId} in chat ${chatId}`);
+    // Approach 1: Standard restriction
+    try {
+      await api.restrictChatMember(chatId, userId, {
+        permissions: {
+          can_send_messages: false,
+          can_send_media_messages: false,
+          can_send_other_messages: false,
+          can_add_web_page_previews: false
+        }
+      });
+      restrictionSucceeded = true;
+      console.log(`Successfully restricted user ${userId} in chat ${chatId} using standard approach`);
+    } catch (error) {
+      console.error(`Error restricting user ${userId} using standard approach:`, error.message);
+    }
+    
+    // If standard approach failed, try alternative approach
+    if (!restrictionSucceeded) {
+      try {
+        await api.restrictChatMember(chatId, userId, {
+          can_send_messages: false,
+          can_send_media_messages: false,
+          can_send_other_messages: false,
+          can_add_web_page_previews: false
+        });
+        restrictionSucceeded = true;
+        console.log(`Successfully restricted user ${userId} in chat ${chatId} using alternative approach`);
+      } catch (error) {
+        console.error(`Error restricting user ${userId} using alternative approach:`, error.message);
+      }
+    }
     
     // Mark as no longer being restricted
     markAsNotBeingRestricted(userId, chatId);
-    return true;
+    
+    return restrictionSucceeded;
   } catch (error) {
     console.error(`Error restricting user ${userId} in chat ${chatId}:`, error);
     // Mark as no longer being restricted
@@ -387,13 +483,25 @@ async function storeCaptcha(userId, chatId, captcha) {
     if (error) {
       console.error("Database error when storing captcha:", error);
       console.error("Error details:", JSON.stringify(error));
+      
+      // Store in memory as fallback
+      markAsHavingPendingCaptcha(userId, chatId, captcha);
+      
       return false;
     } else {
       console.log("Captcha stored successfully, response:", JSON.stringify(data));
+      
+      // Also store in memory for redundancy
+      markAsHavingPendingCaptcha(userId, chatId, captcha);
+      
       return true;
     }
   } catch (error) {
     console.error("Exception during captcha storage:", error);
+    
+    // Store in memory as fallback
+    markAsHavingPendingCaptcha(userId, chatId, captcha);
+    
     return false;
   }
 }
@@ -507,7 +615,13 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
     return;
   }
   
-  // Check if the user already has a captcha
+  // Check if the user already has a captcha in memory
+  if (hasPendingCaptcha(userId, chatId)) {
+    console.log(`User ${userId} already has a pending captcha in memory, not generating a new one`);
+    return;
+  }
+  
+  // Check if the user already has a captcha in the database
   const { data, error } = await supabase
     .from("captchas")
     .select("*")
@@ -516,7 +630,11 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
     .limit(1);
   
   if (!error && data && data.length > 0) {
-    console.log(`User ${userId} already has a captcha, not generating a new one`);
+    console.log(`User ${userId} already has a captcha in database, not generating a new one`);
+    
+    // Store in memory for redundancy
+    markAsHavingPendingCaptcha(userId, chatId, data[0].captcha);
+    
     return;
   }
   
@@ -533,38 +651,33 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
     const restrictSuccess = await restrictUser(ctx.api, chatId, userId);
     
     if (!restrictSuccess) {
-      console.log(`Failed to restrict user ${userId}, aborting captcha generation`);
-      markAsNotProcessing(userId, chatId);
-      return;
+      console.log(`Failed to restrict user ${userId}, but will still generate captcha`);
+      // Continue anyway, as the user might already be restricted by another admin
     }
     
     // Store the captcha in the database
     const stored = await storeCaptcha(userId, chatId, captcha);
     
-    if (stored) {
-      // Get chat title
-      let chatTitle = "the group";
-      try {
-        const chatInfo = await ctx.api.getChat(chatId);
-        if (chatInfo && chatInfo.title) {
-          chatTitle = chatInfo.title;
-        }
-      } catch (chatError) {
-        console.error("Error getting chat info:", chatError);
+    // Get chat title
+    let chatTitle = "the group";
+    try {
+      const chatInfo = await ctx.api.getChat(chatId);
+      if (chatInfo && chatInfo.title) {
+        chatTitle = chatInfo.title;
       }
-      
-      // Send captcha message in the group
-      console.log("Sending captcha message");
-      await ctx.api.sendMessage(
-        chatId,
-        addAttribution(
-          `Welcome, ${firstName}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
-        ),
-      );
-      console.log("Captcha message sent successfully");
-    } else {
-      console.error("Failed to store captcha, not sending message");
+    } catch (chatError) {
+      console.error("Error getting chat info:", chatError);
     }
+    
+    // Send captcha message in the group
+    console.log("Sending captcha message");
+    await ctx.api.sendMessage(
+      chatId,
+      addAttribution(
+        `Welcome, ${firstName}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
+      ),
+    );
+    console.log("Captcha message sent successfully");
     
     // Mark user as no longer being processed
     markAsNotProcessing(userId, chatId);
@@ -572,6 +685,102 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
     console.error("Error handling new member:", error);
     // Mark user as no longer being processed
     markAsNotProcessing(userId, chatId);
+  }
+}
+
+// Function to verify captcha and unrestrict user
+async function verifyCaptchaAndUnrestrict(ctx, userId, groupChatId, captchaRecord) {
+  // Check if this user is already being processed
+  if (isProcessing(userId, groupChatId)) {
+    console.log(`User ${userId} is already being processed, ignoring duplicate verification`);
+    await ctx.reply("Your captcha is already being processed. Please wait a moment.");
+    return false;
+  }
+  
+  // Mark user as being processed
+  markAsProcessing(userId, groupChatId);
+  
+  try {
+    // Get chat info to get the title
+    let chatTitle = "the group";
+    try {
+      const chatInfo = await ctx.api.getChat(groupChatId);
+      if (chatInfo && chatInfo.title) {
+        chatTitle = chatInfo.title;
+      }
+    } catch (chatError) {
+      console.error("Error getting chat info:", chatError);
+    }
+    
+    // First, notify the user that verification was successful
+    console.log("Sending initial success message");
+    await ctx.reply(addAttribution(`✅ Captcha verified successfully! You will gain access to ${chatTitle} in a few seconds.`));
+    
+    // Mark the user as verified BEFORE removing restrictions
+    markUserAsVerified(userId, groupChatId);
+    markUserAsMemoryVerified(userId, groupChatId);
+    
+    // Remove from pending captchas
+    markAsNotHavingPendingCaptcha(userId, groupChatId);
+    
+    // Try to store in database, but continue even if it fails
+    try {
+      await storeVerifiedStatus(userId, groupChatId);
+    } catch (dbError) {
+      console.error("Error storing verified status:", dbError);
+      // Continue anyway, we'll rely on in-memory verification
+    }
+    
+    // Delete the captcha from the database BEFORE unrestricting
+    console.log(`Deleting captcha for user ${userId}`);
+    if (captchaRecord && captchaRecord.id) {
+      await supabase.from("captchas").delete().eq("id", captchaRecord.id);
+    } else {
+      // If we don't have the record ID, delete by user and chat
+      await supabase.from("captchas").delete().eq("user_id", userId).eq("chat_id", groupChatId);
+    }
+    
+    // Wait for 5 seconds before removing restrictions
+    console.log(`Waiting 5 seconds before removing restrictions for user ${userId}...`);
+    await delay(5000);
+    
+    // Now remove restrictions using multiple methods
+    console.log(`Removing restrictions for user ${userId} in chat ${groupChatId}`);
+    const success = await unrestrict(ctx.api, groupChatId, userId);
+    
+    if (success) {
+      console.log(`Restrictions removed for user ${userId}`);
+      
+      // Send a follow-up confirmation
+      console.log("Sending final success message");
+      await ctx.reply(addAttribution(`✅ You now have full access to ${chatTitle}!`));
+      
+      // Send success message to group
+      console.log("Sending success message to group");
+      try {
+        await ctx.api.sendMessage(
+          groupChatId,
+          addAttribution(`✅ @${ctx.from.username || ctx.from.first_name} has verified their captcha and can now participate in the group.`)
+        );
+      } catch (groupMsgError) {
+        console.error("Error sending group success message:", groupMsgError);
+        // Continue anyway, the user is already unrestricted
+      }
+      
+      console.log("Captcha verification complete");
+      return true;
+    } else {
+      console.error("Failed to remove restrictions");
+      await ctx.reply("There was an error removing restrictions. Please contact the group admin.");
+      return false;
+    }
+  } catch (error) {
+    console.error("Error verifying captcha:", error);
+    await ctx.reply("There was an error verifying your captcha. Please contact the group admin.");
+    return false;
+  } finally {
+    // Mark user as no longer being processed
+    markAsNotProcessing(userId, groupChatId);
   }
 }
 
@@ -630,88 +839,8 @@ bot.on("message:text", async (ctx) => {
         }
         
         if (captchaVerified && captchaRecord) {
-          // Check if this user is already being processed
-          if (isProcessing(userId, groupChatId)) {
-            console.log(`User ${userId} is already being processed, ignoring duplicate verification`);
-            await ctx.reply("Your captcha is already being processed. Please wait a moment.");
-            return;
-          }
-          
-          // Mark user as being processed
-          markAsProcessing(userId, groupChatId);
-          
-          // Correct captcha
-          console.log(`Captcha correct for user ${userId}`);
-          try {
-            // Get chat info to get the title
-            let chatTitle = "the group";
-            try {
-              const chatInfo = await ctx.api.getChat(groupChatId);
-              if (chatInfo && chatInfo.title) {
-                chatTitle = chatInfo.title;
-              }
-            } catch (chatError) {
-              console.error("Error getting chat info:", chatError);
-            }
-            
-            // First, notify the user that verification was successful
-            console.log("Sending initial success message to private chat");
-            await ctx.reply(addAttribution(`✅ Captcha verified successfully! You will gain access to ${chatTitle} in a few seconds.`));
-            
-            // Mark the user as verified BEFORE removing restrictions
-            markUserAsVerified(userId, groupChatId);
-            markUserAsMemoryVerified(userId, groupChatId);
-            
-            // Try to store in database, but continue even if it fails
-            try {
-              await storeVerifiedStatus(userId, groupChatId);
-            } catch (dbError) {
-              console.error("Error storing verified status:", dbError);
-              // Continue anyway, we'll rely on in-memory verification
-            }
-            
-            // Delete the captcha from the database BEFORE unrestricting
-            console.log(`Deleting captcha for user ${userId}`);
-            await supabase.from("captchas").delete().eq("id", captchaRecord.id);
-            
-            // Wait for 5 seconds before removing restrictions
-            console.log(`Waiting 5 seconds before removing restrictions for user ${userId}...`);
-            await delay(5000);
-            
-            // Now remove restrictions using multiple methods
-            console.log(`Removing restrictions for user ${userId} in chat ${groupChatId}`);
-            const success = await unrestrict(ctx.api, groupChatId, userId);
-            
-            if (success) {
-              console.log(`Restrictions removed for user ${userId}`);
-              
-              // Send a follow-up confirmation
-              console.log("Sending final success message to private chat");
-              await ctx.reply(addAttribution(`✅ You now have full access to ${chatTitle}!`));
-              
-              // Send success message to group
-              console.log("Sending success message to group");
-              await ctx.api.sendMessage(
-                groupChatId,
-                addAttribution(`✅ @${ctx.from.username || ctx.from.first_name} has verified their captcha and can now participate in the group.`)
-              );
-              
-              console.log("Captcha verification complete");
-            } else {
-              console.error("Failed to remove restrictions");
-              await ctx.reply("There was an error removing restrictions. Please contact the group admin.");
-            }
-            
-            // Mark user as no longer being processed
-            markAsNotProcessing(userId, groupChatId);
-            return;
-          } catch (error) {
-            console.error("Error verifying captcha:", error);
-            // Mark user as no longer being processed
-            markAsNotProcessing(userId, groupChatId);
-            await ctx.reply("There was an error verifying your captcha. Please contact the group admin.");
-            return;
-          }
+          await verifyCaptchaAndUnrestrict(ctx, userId, groupChatId, captchaRecord);
+          return;
         } else {
           // Incorrect captcha
           console.log(`Incorrect captcha for user ${userId}`);
@@ -740,6 +869,9 @@ bot.on("message:text", async (ctx) => {
                 // Delete the captcha from the database
                 console.log(`Deleting captcha for user ${userId}`);
                 await supabase.from("captchas").delete().eq("id", mostRecentCaptcha.id);
+                
+                // Remove from pending captchas
+                markAsNotHavingPendingCaptcha(userId, mostRecentCaptcha.chat_id);
               } catch (error) {
                 console.error("Error kicking user:", error);
                 await ctx.reply("There was an error processing your captcha. Please contact the group admin.");
@@ -792,67 +924,7 @@ bot.on("message:text", async (ctx) => {
     
     console.log(`Comparing user input "${userInput}" with captcha "${captcha}"`);
     if (userInput === captcha) {
-      // Check if this user is already being processed
-      if (isProcessing(userId, chatId)) {
-        console.log(`User ${userId} is already being processed, ignoring duplicate verification`);
-        await ctx.reply("Your captcha is already being processed. Please wait a moment.");
-        return;
-      }
-      
-      // Mark user as being processed
-      markAsProcessing(userId, chatId);
-      
-      // Correct captcha
-      console.log(`Captcha correct for user ${userId}, waiting before removing restrictions...`);
-      try {
-        // First, notify the user that verification was successful
-        await ctx.reply(addAttribution(`✅ Captcha verified successfully! You will gain access to the group in a few seconds.`));
-        
-        // Mark the user as verified BEFORE removing restrictions
-        markUserAsVerified(userId, chatId);
-        markUserAsMemoryVerified(userId, chatId);
-        
-        // Try to store in database, but continue even if it fails
-        try {
-          await storeVerifiedStatus(userId, chatId);
-        } catch (dbError) {
-          console.error("Error storing verified status:", dbError);
-          // Continue anyway, we'll rely on in-memory verification
-        }
-        
-        // Delete the captcha from the database BEFORE unrestricting
-        console.log(`Deleting captcha for user ${userId}`);
-        await supabase.from("captchas").delete().eq("id", data[0].id);
-        
-        // Wait for 5 seconds before removing restrictions
-        console.log(`Waiting 5 seconds before removing restrictions for user ${userId}...`);
-        await delay(5000);
-        
-        // Now remove restrictions using multiple methods
-        console.log(`Removing restrictions for user ${userId}`);
-        const success = await unrestrict(ctx.api, chatId, userId);
-        
-        if (success) {
-          console.log(`Restrictions removed for user ${userId}`);
-          
-          // Send success message
-          console.log("Sending success message");
-          await ctx.reply(addAttribution(`✅ You now have full access to the group!`));
-          console.log("Success message sent");
-          
-          console.log("Captcha verification complete");
-        } else {
-          console.error("Failed to remove restrictions");
-          await ctx.reply("There was an error removing restrictions. Please contact the group admin.");
-        }
-        
-        // Mark user as no longer being processed
-        markAsNotProcessing(userId, chatId);
-      } catch (error) {
-        console.error("Error verifying captcha:", error);
-        // Mark user as no longer being processed
-        markAsNotProcessing(userId, chatId);
-      }
+      await verifyCaptchaAndUnrestrict(ctx, userId, chatId, data[0]);
     } else {
       // Incorrect captcha
       console.log(`Incorrect captcha for user ${userId}`);
@@ -881,6 +953,9 @@ bot.on("message:text", async (ctx) => {
           console.log(`Deleting captcha for user ${userId}`);
           await supabase.from("captchas").delete().eq("id", data[0].id);
           console.log("Captcha deleted from database");
+          
+          // Remove from pending captchas
+          markAsNotHavingPendingCaptcha(userId, chatId);
         } catch (error) {
           console.error("Error kicking user:", error);
         }
@@ -1006,7 +1081,13 @@ bot.on("chat_member", async (ctx) => {
         return;
       }
       
-      // Check if the user already has a captcha
+      // Check if the user already has a captcha in memory
+      if (hasPendingCaptcha(userId, chatId)) {
+        console.log(`User ${userId} already has a pending captcha in memory, not generating a new one`);
+        return;
+      }
+      
+      // Check if the user already has a captcha in the database
       const { data, error } = await supabase
         .from("captchas")
         .select("*")
@@ -1016,6 +1097,10 @@ bot.on("chat_member", async (ctx) => {
       
       if (!error && data && data.length > 0) {
         console.log(`User ${userId} already has a captcha, not generating a new one`);
+        
+        // Store in memory for redundancy
+        markAsHavingPendingCaptcha(userId, chatId, data[0].captcha);
+        
         return;
       }
       
@@ -1028,19 +1113,15 @@ bot.on("chat_member", async (ctx) => {
       // Store the captcha in the database with attempts field - using the new function
       const stored = await storeCaptcha(userId, chatId, captcha);
       
-      if (stored) {
-        // Send captcha message in the group
-        console.log("Sending captcha message");
-        await ctx.api.sendMessage(
-          chatId,
-          addAttribution(
-            `Welcome, ${member.user.first_name}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
-          ),
-        );
-        console.log("Captcha message sent successfully");
-      } else {
-        console.error("Failed to store captcha, not sending message");
-      }
+      // Send captcha message in the group
+      console.log("Sending captcha message");
+      await ctx.api.sendMessage(
+        chatId,
+        addAttribution(
+          `Welcome, ${member.user.first_name}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
+        ),
+      );
+      console.log("Captcha message sent successfully");
     } 
     // Also handle new members joining
     else if (member.status === "member" && (!oldMember || oldMember.status !== "member")) {
@@ -1316,6 +1397,9 @@ bot.command("clearcaptcha", async (ctx) => {
       .delete()
       .eq("user_id", targetUserId)
       .eq("chat_id", chatId);
+    
+    // Also remove from memory
+    markAsNotHavingPendingCaptcha(targetUserId, chatId);
     
     if (error) {
       console.error("Error clearing captcha:", error);
