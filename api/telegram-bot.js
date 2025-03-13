@@ -89,21 +89,58 @@ function isRecentlyVerified(userId, chatId) {
   return verifiedUsers.has(key) || memoryVerifiedUsers.has(key) || permanentlyVerifiedUsers.has(key);
 }
 
-// Function to check if a user is in grace period
-function isInGracePeriod(userId, chatId) {
-  const key = `${userId}:${chatId}`;
-  const inGrace = graceUsers.has(key);
-  console.log(`GRACE CHECK: User ${userId} in chat ${chatId} is in grace period: ${inGrace}`);
-  if (inGrace) {
-    const timestamp = graceUsers.get(key);
-    const elapsedMs = Date.now() - timestamp;
-    const remainingSecs = Math.max(0, Math.floor((GRACE_PERIOD - elapsedMs) / 1000));
-    console.log(`GRACE INFO: ${remainingSecs} seconds remaining in grace period`);
+// Function to check if a user is in grace period (now checks database)
+async function isInGracePeriod(userId, chatId) {
+  try {
+    // First check in memory for faster response (though this won't persist across serverless invocations)
+    const key = `${userId}:${chatId}`;
+    const inMemoryGrace = graceUsers.has(key);
+    
+    if (inMemoryGrace) {
+      console.log(`GRACE CHECK: User ${userId} in chat ${chatId} is in grace period (memory): true`);
+      return true;
+    }
+    
+    // Then check the database
+    console.log(`GRACE CHECK: Checking database for grace period status of user ${userId} in chat ${chatId}`);
+    const now = new Date();
+    const graceExpiry = new Date(now.getTime() - GRACE_PERIOD); // Grace period ago
+    
+    const { data, error } = await supabase
+      .from("verified_users")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("chat_id", chatId)
+      .gte("verified_at", graceExpiry.toISOString())
+      .single();
+    
+    if (error && error.code !== "PGRST116") { // PGRST116 is "no rows returned" which is fine
+      console.error("Error checking grace period status:", error);
+      return inMemoryGrace; // Fall back to memory check
+    }
+    
+    const isInGrace = data ? true : false;
+    console.log(`GRACE CHECK: User ${userId} in chat ${chatId} is in grace period (database): ${isInGrace}`);
+    
+    if (isInGrace) {
+      // Also store in memory for faster subsequent checks
+      markUserInGracePeriod(userId, chatId);
+      
+      // Calculate remaining time
+      const verifiedAt = new Date(data.verified_at);
+      const elapsedMs = now.getTime() - verifiedAt.getTime();
+      const remainingSecs = Math.max(0, Math.floor((GRACE_PERIOD - elapsedMs) / 1000));
+      console.log(`GRACE INFO: ${remainingSecs} seconds remaining in grace period`);
+    }
+    
+    return isInGrace;
+  } catch (error) {
+    console.error("Exception checking grace period status:", error);
+    return false;
   }
-  return inGrace;
 }
 
-// Function to mark a user as in grace period
+// Function to mark a user as in grace period (now updates database)
 function markUserInGracePeriod(userId, chatId) {
   const key = `${userId}:${chatId}`;
   const now = Date.now();
@@ -121,6 +158,8 @@ function markUserInGracePeriod(userId, chatId) {
       console.log(`GRACE PERIOD: Not removing user ${userId} from grace period as it was updated`);
     }
   }, GRACE_PERIOD);
+  
+  // Note: The database update is handled by storeVerifiedStatus which is called during verification
 }
 
 // Function to mark a user as permanently verified (after sending a message)
@@ -136,12 +175,52 @@ function markUserAsPermanentlyVerified(userId, chatId) {
   }, 30 * 24 * 60 * 60 * 1000); // 30 days
 
   console.log(`Marked user ${userId} as permanently verified in chat ${chatId}`);
+  
+  // Update the database to mark as permanently verified
+  storeVerifiedStatus(userId, chatId, true).catch(err => {
+    console.error("Error storing permanent verified status:", err);
+  });
 }
 
-// Function to check if a user is permanently verified
-function isPermanentlyVerified(userId, chatId) {
-  const key = `${userId}:${chatId}`;
-  return permanentlyVerifiedUsers.has(key);
+// Function to check if a user is permanently verified (now checks database)
+async function isPermanentlyVerified(userId, chatId) {
+  try {
+    // First check in memory for faster response (though this won't persist across serverless invocations)
+    const key = `${userId}:${chatId}`;
+    const inMemoryVerified = permanentlyVerifiedUsers.has(key);
+    
+    if (inMemoryVerified) {
+      return true;
+    }
+    
+    // Then check the database
+    console.log(`Checking database for permanent verification status of user ${userId} in chat ${chatId}`);
+    const { data, error } = await supabase
+      .from("verified_users")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("chat_id", chatId)
+      .eq("permanent", true)
+      .single();
+    
+    if (error && error.code !== "PGRST116") { // PGRST116 is "no rows returned" which is fine
+      console.error("Error checking permanent verification status:", error);
+      return inMemoryVerified; // Fall back to memory check
+    }
+    
+    const isPermanent = data ? true : false;
+    console.log(`Database permanent verification status for user ${userId} in chat ${chatId}: ${isPermanent ? "Permanently Verified" : "Not Permanently Verified"}`);
+    
+    // If verified in database but not in memory, add to memory
+    if (isPermanent && !inMemoryVerified) {
+      permanentlyVerifiedUsers.set(key, Date.now());
+    }
+    
+    return isPermanent;
+  } catch (error) {
+    console.error("Exception checking permanent verification status:", error);
+    return false;
+  }
 }
 
 // Function to mark a user as verified
@@ -427,20 +506,20 @@ async function restrictUser(api, chatId, userId) {
 
   // ENHANCED LOGGING: Log all verification statuses for debugging
   console.log(`RESTRICT CHECK: Verification status for user ${userId} in chat ${chatId}:`);
-  console.log(`- Permanently verified: ${isPermanentlyVerified(userId, chatId)}`);
+  console.log(`- Permanently verified: ${await isPermanentlyVerified(userId, chatId)}`);
   console.log(`- Recently verified: ${isRecentlyVerified(userId, chatId)}`);
   console.log(`- Unrestricted by bot: ${wasUnrestrictedByBot(userId, chatId)}`);
   console.log(`- Memory verified: ${memoryVerifiedUsers.has(`${userId}:${chatId}`)}`);
-  console.log(`- In grace period: ${isInGracePeriod(userId, chatId)}`);
+  console.log(`- In grace period: ${await isInGracePeriod(userId, chatId)}`);
 
   // NEW: Check if user is permanently verified
-  if (isPermanentlyVerified(userId, chatId)) {
+  if (await isPermanentlyVerified(userId, chatId)) {
     console.log(`User ${userId} is permanently verified, not restricting`);
     return false;
   }
 
   // NEW: Check if user is in grace period
-  if (isInGracePeriod(userId, chatId)) {
+  if (await isInGracePeriod(userId, chatId)) {
     console.log(`GRACE PROTECTION: User ${userId} is in grace period, not restricting`);
     return false;
   }
@@ -569,7 +648,7 @@ async function storeCaptcha(userId, chatId, captcha) {
 async function checkVerifiedStatus(userId, chatId) {
   try {
     // First check in memory for faster response
-    if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId) || memoryVerifiedUsers.has(`${userId}:${chatId}`) || isPermanentlyVerified(userId, chatId)) {
+    if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId) || memoryVerifiedUsers.has(`${userId}:${chatId}`) || await isPermanentlyVerified(userId, chatId)) {
       console.log(`User ${userId} is verified in memory for chat ${chatId}`);
       return true;
     }
@@ -604,7 +683,7 @@ async function checkVerifiedStatus(userId, chatId) {
 }
 
 // Function to mark a user as verified in the database
-async function storeVerifiedStatus(userId, chatId) {
+async function storeVerifiedStatus(userId, chatId, permanent = false) {
   try {
     // First check if the record already exists
     console.log(`Checking if user ${userId} is already verified in chat ${chatId}`);
@@ -621,22 +700,56 @@ async function storeVerifiedStatus(userId, chatId) {
       return false;
     }
     
-    // If record exists, we're done
+    // If record exists, update it if needed
     if (existingData && existingData.length > 0) {
-      console.log(`User ${userId} already marked as verified in chat ${chatId}`);
+      console.log(`User ${userId} already has a verification record in chat ${chatId}`);
+      
+      // If we're setting permanent and it's not already permanent, update it
+      if (permanent && !existingData[0].permanent) {
+        console.log(`Updating user ${userId} to permanent verification in chat ${chat  {
+        console.log(`Updating user ${userId} to permanent verification in chat ${chatId}`);
+        
+        const { error: updateError } = await supabase
+          .from("verified_users")
+          .update({ 
+            permanent: true,
+            verified_at: new Date().toISOString() // Also update the timestamp
+          })
+          .eq("id", existingData[0].id);
+        
+        if (updateError) {
+          console.error("Error updating to permanent verification:", updateError);
+          return false;
+        }
+        
+        console.log(`Updated user ${userId} to permanent verification in chat ${chatId}`);
+      } else {
+        // Update the verified_at timestamp to extend the grace period
+        const { error: updateError } = await supabase
+          .from("verified_users")
+          .update({ verified_at: new Date().toISOString() })
+          .eq("id", existingData[0].id);
+        
+        if (updateError) {
+          console.error("Error updating verification timestamp:", updateError);
+        } else {
+          console.log(`Updated verification timestamp for user ${userId} in chat ${chatId}`);
+        }
+      }
+      
       return true;
     }
     
     // Otherwise insert a new record
     console.log(`Storing verified status for user ${userId} in chat ${chatId}`);
     
-    // Try with explicit RLS bypass headers
     const { error } = await supabase
       .from("verified_users")
       .insert({
         user_id: userId,
         chat_id: chatId,
-        verified_at: new Date().toISOString()
+        verified_at: new Date().toISOString(),
+        permanent: permanent
       })
       .select();
     
@@ -663,14 +776,14 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
 
   // ENHANCED LOGGING: Log all verification statuses for debugging
   console.log(`Verification status for user ${userId} in chat ${chatId}:`);
-  console.log(`- Permanently verified: ${isPermanentlyVerified(userId, chatId)}`);
+  console.log(`- Permanently verified: ${await isPermanentlyVerified(userId, chatId)}`);
   console.log(`- Recently verified: ${isRecentlyVerified(userId, chatId)}`);
   console.log(`- Unrestricted by bot: ${wasUnrestrictedByBot(userId, chatId)}`);
   console.log(`- Memory verified: ${memoryVerifiedUsers.has(`${userId}:${chatId}`)}`);
-  console.log(`- In grace period: ${isInGracePeriod(userId, chatId)}`);
+  console.log(`- In grace period: ${await isInGracePeriod(userId, chatId)}`);
 
   // NEW: Check if user is permanently verified
-  if (isPermanentlyVerified(userId, chatId)) {
+  if (await isPermanentlyVerified(userId, chatId)) {
     console.log(`User ${userId} is permanently verified, not generating captcha`);
     
     // Ensure they're unrestricted
@@ -688,7 +801,7 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
   }
 
   // NEW: Check if user is in grace period
-  if (isInGracePeriod(userId, chatId)) {
+  if (await isInGracePeriod(userId, chatId)) {
     console.log(`GRACE PROTECTION: User ${userId} is in grace period, not generating captcha`);
     
     // Ensure they're unrestricted
@@ -984,12 +1097,12 @@ bot.on("message:text", async (ctx) => {
     const chatId = ctx.chat.id;
 
     // NEW: Check if user is in grace period and mark as permanently verified if they send a message
-    if (isInGracePeriod(userId, chatId)) {
+    if (await isInGracePeriod(userId, chatId)) {
       console.log(`GRACE PERIOD MESSAGE: User ${userId} sent a message during grace period, marking as permanently verified`);
       markUserAsPermanentlyVerified(userId, chatId);
       
       // Also store in database for persistence
-      storeVerifiedStatus(userId, chatId).catch(err => {
+      storeVerifiedStatus(userId, chatId, true).catch(err => {
         console.error("Error storing permanent verified status:", err);
       });
       
@@ -1084,12 +1197,12 @@ bot.on("message", async (ctx) => {
     }
 
     // NEW: Check if user is in grace period and mark as permanently verified if they send a message
-    if (ctx.from && ctx.chat && ctx.chat.type !== "private" && isInGracePeriod(ctx.from.id, ctx.chat.id)) {
+    if (ctx.from && ctx.chat && ctx.chat.type !== "private" && await isInGracePeriod(ctx.from.id, ctx.chat.id)) {
       console.log(`GRACE PERIOD MESSAGE: User ${ctx.from.id} sent a message during grace period, marking as permanently verified`);
       markUserAsPermanentlyVerified(ctx.from.id, ctx.chat.id);
       
       // Also store in database for persistence
-      storeVerifiedStatus(ctx.from.id, ctx.chat.id).catch(err => {
+      storeVerifiedStatus(ctx.from.id, ctx.chat.id, true).catch(err => {
         console.error("Error storing permanent verified status:", err);
       });
     }
@@ -1165,14 +1278,14 @@ bot.on("chat_member", async (ctx) => {
     
     // ENHANCED LOGGING: Log all verification statuses for debugging
     console.log(`Verification status for user ${userId} in chat ${chatId}:`);
-    console.log(`- Permanently verified: ${isPermanentlyVerified(userId, chatId)}`);
+    console.log(`- Permanently verified: ${await isPermanentlyVerified(userId, chatId)}`);
     console.log(`- Recently verified: ${isRecentlyVerified(userId, chatId)}`);
     console.log(`- Unrestricted by bot: ${wasUnrestrictedByBot(userId, chatId)}`);
     console.log(`- Memory verified: ${memoryVerifiedUsers.has(`${userId}:${chatId}`)}`);
-    console.log(`- In grace period: ${isInGracePeriod(userId, chatId)}`);
+    console.log(`- In grace period: ${await isInGracePeriod(userId, chatId)}`);
     
     // NEW: Check if user is permanently verified
-    if (isPermanentlyVerified(userId, chatId)) {
+    if (await isPermanentlyVerified(userId, chatId)) {
       console.log(`User ${userId} is permanently verified, ignoring restriction`);
       
       // If they're restricted, try to unrestrict them immediately
@@ -1185,7 +1298,7 @@ bot.on("chat_member", async (ctx) => {
     }
     
     // NEW: Check if user is in grace period
-    if (isInGracePeriod(userId, chatId)) {
+    if (await isInGracePeriod(userId, chatId)) {
       console.log(`GRACE PROTECTION: User ${userId} is in grace period, ignoring restriction`);
       
       // If they're restricted, try to unrestrict them immediately
@@ -1216,9 +1329,6 @@ bot.on("chat_member", async (ctx) => {
     if (member.status === "restricted" && 
         (!oldMember || oldMember.status !== "restricted" || 
          (oldMember.can_send_messages && !member.can_send_messages))) {
-      
-      // FIXED: Don't skip captcha generation even if the bot restricted the user
-      // Instead, check if they already have a captcha
       
       // Check if user is already verified in the database
       const isVerified = await checkVerifiedStatus(userId, chatId);
@@ -1398,8 +1508,8 @@ bot.command("debug", async (ctx) => {
       const isRecentlyVerifiedInMemory = isRecentlyVerified(ctx.from.id, chatId);
       const isUnrestrictedByBot = wasUnrestrictedByBot(ctx.from.id, chatId);
       const isMemoryVerified = memoryVerifiedUsers.has(`${ctx.from.id}:${chatId}`);
-      const isPermanentVerified = isPermanentlyVerified(ctx.from.id, chatId);
-      const isGracePeriod = isInGracePeriod(ctx.from.id, chatId);
+      const isPermanentVerified = await isPermanentlyVerified(ctx.from.id, chatId);
+      const isGracePeriod = await isInGracePeriod(ctx.from.id, chatId);
       
       verifiedInfo = `\nVerified Status: ${isVerifiedInDb ? "✅ Verified in DB" : "❌ Not Verified in DB"}`;
       verifiedInfo += `\nRecently Verified (in-memory): ${isRecentlyVerifiedInMemory ? "✅ Yes" : "❌ No"}`;
