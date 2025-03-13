@@ -760,10 +760,6 @@ async function verifyCaptchaAndUnrestrict(ctx, userId, groupChatId, captchaRecor
     }
 
     // First, notify the user that verification was successful
-    await ctx.  chatError);
-    }
-
-    // First, notify the user that verification was successful
     await ctx.reply(addAttribution(`✅ Captcha verified successfully! You will gain access to ${chatTitle} in a few seconds.`));
 
     // Mark the user as verified BEFORE removing restrictions
