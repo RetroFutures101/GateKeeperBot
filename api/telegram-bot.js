@@ -12,6 +12,7 @@ const UNRESTRICT_TIMEOUT = 8000; // 8 seconds to allow for Vercel's 10s timeout
 const UNRESTRICT_RETRY_DELAY = 1000; // 1 second between retries
 const MAX_UNRESTRICT_RETRIES = 3; // Maximum number of retries for unrestriction
 const GRACE_PERIOD = 60 * 1000; // 60 seconds grace period after verification
+const MESSAGE_AUTO_DELETE_DELAY = 2 * 60 * 1000; // 2 minutes for auto-deleting messages
 
 // Helper function for delayed execution
 function delay(ms) {
@@ -67,6 +68,31 @@ bot.use(
     }),
   })
 );
+
+// Helper function to send a message and delete it after a specified time
+async function sendTemporaryMessage(api, chatId, text, deleteAfterMs = MESSAGE_AUTO_DELETE_DELAY) {
+  try {
+    const sentMessage = await api.sendMessage(chatId, text);
+    console.log(`Sent temporary message ${sentMessage.message_id} in chat ${chatId}, will delete after ${deleteAfterMs}ms`);
+    
+    // Schedule deletion
+    setTimeout(async () => {
+      try {
+        await api.deleteMessage(chatId, sentMessage.message_id);
+        console.log(`Auto-deleted message ${sentMessage.message_id} in chat ${chatId}`);
+      } catch (error) {
+        console.error(`Failed to auto-delete message: ${error.message}`);
+        // Failure to delete doesn't affect core functionality
+      }
+    }, deleteAfterMs);
+    
+    return sentMessage;
+  } catch (error) {
+    console.error(`Error sending temporary message: ${error.message}`);
+    // If sending fails, just log it and continue
+    return null;
+  }
+}
 
 // Generate a random 6-digit alphanumerical captcha
 function generateCaptcha() {
@@ -167,12 +193,12 @@ function markUserAsPermanentlyVerified(userId, chatId) {
   const key = `${userId}:${chatId}`;
   permanentlyVerifiedUsers.set(key, Date.now());
 
-  // This is permanent, but we'll still clean it up after a very long time (30 days)
-  // to prevent memory leaks in long-running instances
+  // This is permanent, but we'll still clean it up after a very long time to prevent memory leaks
+  // Use a smaller value to avoid TimeoutOverflowWarning
   setTimeout(() => {
     permanentlyVerifiedUsers.delete(key);
     console.log(`Removed user ${userId} from permanently verified list for chat ${chatId} (cleanup)`);
-  }, 30 * 24 * 60 * 60 * 1000); // 30 days
+  }, 2147483647); // Maximum safe integer for setTimeout (about 24.8 days)
 
   console.log(`Marked user ${userId} as permanently verified in chat ${chatId}`);
   
@@ -695,6 +721,8 @@ async function storeVerifiedStatus(userId, chatId, permanent = false) {
     
     if (checkError) {
       console.error("Error checking existing verified status:", checkError);
+      // Mark as  {
+      console.error("Error checking existing verified status:", checkError);
       // Mark as memory-verified as a fallback
       markUserAsMemoryVerified(userId, chatId);
       return false;
@@ -873,12 +901,14 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
     }
     
     // NEW APPROACH: Send a message in the group tagging the user to check their DMs
+    // Use sendTemporaryMessage to auto-delete after 2 minutes
     console.log("Sending DM notification message");
-    await ctx.api.sendMessage(
+    await sendTemporaryMessage(
+      ctx.api,
       chatId,
       addAttribution(
         `Welcome, ${firstName}! @${username || firstName}\n\nPlease check your direct messages from me to complete the captcha verification and gain access to ${chatTitle}.`
-      ),
+      )
     );
     
     // Send the captcha directly to the user in a DM
@@ -894,11 +924,12 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
       console.error("Error sending DM to user:", dmError);
       
       // If we can't send a DM, fall back to the old approach of sending the captcha in the group
-      await ctx.api.sendMessage(
+      await sendTemporaryMessage(
+        ctx.api,
         chatId,
         addAttribution(
           `${firstName}, I couldn't send you a direct message. Please click on my username (@${ctx.me.username}) and start a chat with me, then send me this captcha code:\n\n${captcha}`
-        ),
+        )
       );
     }
     
@@ -972,7 +1003,9 @@ async function verifyCaptchaAndUnrestrict(ctx, userId, groupChatId, captchaRecor
       await ctx.reply(addAttribution(`✅ You now have full access to ${chatTitle}! Please send a message in the group within the next 60 seconds to confirm your membership.`));
       
       try {
-        await ctx.api.sendMessage(
+        // Use sendTemporaryMessage for the group success message
+        await sendTemporaryMessage(
+          ctx.api,
           groupChatId,
           addAttribution(`✅ @${ctx.from.username || ctx.from.first_name} has verified their captcha and can now participate in the group. Please send a message within 60 seconds to confirm your membership.`)
         );
@@ -1178,7 +1211,12 @@ bot.on("message:text", async (ctx) => {
           await ctx.api.unbanChatMember(chatId, userId); // Unban immediately to allow rejoining
           console.log(`User ${userId} kicked and unbanned`);
           
-          await ctx.reply(addAttribution(`❌ Too many failed attempts. Please rejoin the group and try again.`));
+          // Use sendTemporaryMessage for the failure message
+          await sendTemporaryMessage(
+            ctx.api,
+            chatId,
+            addAttribution(`❌ Too many failed attempts. Please rejoin the group and try again.`)
+          );
           console.log("Kick message sent");
           
           // Delete the captcha from the database
@@ -1194,8 +1232,11 @@ bot.on("message:text", async (ctx) => {
       } else {
         // Allow more attempts
         console.log(`Sending incorrect captcha message, ${3 - attempts} attempts left`);
-        await ctx.reply(
-          addAttribution(`❌ Incorrect captcha. Please try again. You have ${3 - attempts} attempts left.`),
+        // Use sendTemporaryMessage for the incorrect captcha message
+        await sendTemporaryMessage(
+          ctx.api,
+          chatId,
+          addAttribution(`❌ Incorrect captcha. Please try again. You have ${3 - attempts} attempts left.`)
         );
         console.log("Incorrect captcha message sent");
       }
@@ -1394,12 +1435,14 @@ bot.on("chat_member", async (ctx) => {
       const stored = await storeCaptcha(userId, chatId, captcha);
       
       // NEW APPROACH: Send a message in the group tagging the user to check their DMs
+      // Use sendTemporaryMessage to auto-delete after 2 minutes
       console.log("Sending DM notification message");
-      await ctx.api.sendMessage(
+      await sendTemporaryMessage(
+        ctx.api,
         chatId,
         addAttribution(
           `Welcome, ${member.user.first_name}! @${member.user.username || member.user.first_name}\n\nPlease check your direct messages from me to complete the captcha verification and gain access to ${chatTitle}.`
-        ),
+        )
       );
       
       // Send the captcha directly to the user in a DM
@@ -1415,11 +1458,12 @@ bot.on("chat_member", async (ctx) => {
         console.error("Error sending DM to user:", dmError);
         
         // If we can't send a DM, fall back to the old approach of sending the captcha in the group
-        await ctx.api.sendMessage(
+        await sendTemporaryMessage(
+          ctx.api,
           chatId,
           addAttribution(
             `${member.user.first_name}, I couldn't send you a direct message. Please click on my username (@${ctx.me.username}) and start a chat with me, then send me this captcha code:\n\n${captcha}`
-          ),
+          )
         );
       }
     } 
@@ -1443,10 +1487,6 @@ bot.on("message:new_chat_members", async (ctx) => {
     
     // Safely check if required properties exist
     if (!ctx.message || !ctx.message.new_chat_members || !ctx.chat || !ctx.me) {
-      console.log("Missing required new_chat_members properties");
-      return;
-    }
-      {
       console.log("Missing required new_chat_members properties");
       return;
     }
