@@ -37,6 +37,8 @@ const verifiedUsers = new Map();
 const processingUsers = new Map();
 // Track users who have been restricted by the bot to prevent re-restriction
 const restrictedByBot = new Map();
+// Track users who have been unrestricted by the bot
+const unrestrictedByBot = new Map();
 
 // Initialize session
 bot.use(
@@ -74,11 +76,11 @@ function markUserAsVerified(userId, chatId) {
   const key = `${userId}:${chatId}`;
   verifiedUsers.set(key, Date.now());
   
-  // Remove from verified list after 30 minutes to allow future captchas if needed
+  // Remove from verified list after 60 minutes to allow future captchas if needed
   setTimeout(() => {
     verifiedUsers.delete(key);
     console.log(`Removed user ${userId} from verified list for chat ${chatId}`);
-  }, 30 * 60 * 1000); // 30 minutes
+  }, 60 * 60 * 1000); // 60 minutes
   
   console.log(`Marked user ${userId} as verified in chat ${chatId}`);
 }
@@ -130,6 +132,26 @@ function wasRestrictedByBot(userId, chatId) {
   return restrictedByBot.has(key);
 }
 
+// Function to mark a user as unrestricted by the bot
+function markAsUnrestrictedByBot(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  unrestrictedByBot.set(key, Date.now());
+  
+  // Keep this record for a longer time (2 hours) to prevent re-restriction loops
+  setTimeout(() => {
+    unrestrictedByBot.delete(key);
+    console.log(`Removed user ${userId} from unrestricted-by-bot list for chat ${chatId}`);
+  }, 2 * 60 * 60 * 1000); // 2 hours
+  
+  console.log(`Marked user ${userId} as unrestricted by bot in chat ${chatId}`);
+}
+
+// Function to check if a user was unrestricted by the bot
+function wasUnrestrictedByBot(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  return unrestrictedByBot.has(key);
+}
+
 // Function to unrestrict a user with multiple approaches
 async function unrestrict(api, chatId, userId) {
   console.log(`Attempting to unrestrict user ${userId} in chat ${chatId} using multiple methods`);
@@ -138,8 +160,13 @@ async function unrestrict(api, chatId, userId) {
     // Mark the user as verified BEFORE unrestricting to prevent re-restriction loops
     markUserAsVerified(userId, chatId);
     
-    // Store verified status in database
-    await storeVerifiedStatus(userId, chatId);
+    // Store verified status in database - with better error handling
+    try {
+      await storeVerifiedStatus(userId, chatId);
+    } catch (dbError) {
+      console.error("Error storing verified status in database:", dbError);
+      // Continue anyway, we'll rely on in-memory verification
+    }
     
     // First approach: Simple permission object (old style)
     console.log("Method 1: Using simple permission object (old style)");
@@ -215,6 +242,9 @@ async function unrestrict(api, chatId, userId) {
       console.log("Method 4 failed:", error.message);
     }
     
+    // Mark the user as unrestricted by the bot
+    markAsUnrestrictedByBot(userId, chatId);
+    
     console.log("All unrestriction methods attempted");
     return true;
   } catch (error) {
@@ -274,7 +304,14 @@ async function storeCaptcha(userId, chatId, captcha) {
 // Function to check if a user has a verified status in the database
 async function checkVerifiedStatus(userId, chatId) {
   try {
-    // Check if we have a record in the verified_users table
+    // First check in memory for faster response
+    if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId)) {
+      console.log(`User ${userId} is verified in memory for chat ${chatId}`);
+      return true;
+    }
+    
+    // Then check the database
+    console.log(`Checking database for verified status of user ${userId} in chat ${chatId}`);
     const { data, error } = await supabase
       .from("verified_users")
       .select("*")
@@ -287,7 +324,15 @@ async function checkVerifiedStatus(userId, chatId) {
       return false;
     }
     
-    return data ? true : false;
+    const isVerified = data ? true : false;
+    console.log(`Database verification status for user ${userId} in chat ${chatId}: ${isVerified ? "Verified" : "Not verified"}`);
+    
+    // If verified in database but not in memory, add to memory
+    if (isVerified && !isRecentlyVerified(userId, chatId)) {
+      markUserAsVerified(userId, chatId);
+    }
+    
+    return isVerified;
   } catch (error) {
     console.error("Exception checking verified status:", error);
     return false;
@@ -298,6 +343,7 @@ async function checkVerifiedStatus(userId, chatId) {
 async function storeVerifiedStatus(userId, chatId) {
   try {
     // First check if the record already exists
+    console.log(`Checking if user ${userId} is already verified in chat ${chatId}`);
     const { data: existingData, error: checkError } = await supabase
       .from("verified_users")
       .select("*")
@@ -316,6 +362,7 @@ async function storeVerifiedStatus(userId, chatId) {
     }
     
     // Otherwise insert a new record
+    console.log(`Storing verified status for user ${userId} in chat ${chatId}`);
     const { error } = await supabase
       .from("verified_users")
       .insert({
@@ -422,7 +469,13 @@ bot.on("message:text", async (ctx) => {
             
             // Mark the user as verified BEFORE removing restrictions
             markUserAsVerified(userId, groupChatId);
-            await storeVerifiedStatus(userId, groupChatId);
+            
+            try {
+              await storeVerifiedStatus(userId, groupChatId);
+            } catch (dbError) {
+              console.error("Error storing verified status:", dbError);
+              // Continue anyway, we'll rely on in-memory verification
+            }
             
             // Delete the captcha from the database BEFORE unrestricting
             console.log(`Deleting captcha for user ${userId}`);
@@ -564,7 +617,13 @@ bot.on("message:text", async (ctx) => {
         
         // Mark the user as verified BEFORE removing restrictions
         markUserAsVerified(userId, chatId);
-        await storeVerifiedStatus(userId, chatId);
+        
+        try {
+          await storeVerifiedStatus(userId, chatId);
+        } catch (dbError) {
+          console.error("Error storing verified status:", dbError);
+          // Continue anyway, we'll rely on in-memory verification
+        }
         
         // Delete the captcha from the database BEFORE unrestricting
         console.log(`Deleting captcha for user ${userId}`);
@@ -699,6 +758,12 @@ bot.on("chat_member", async (ctx) => {
     }
 
     // Skip if it's the bot itself
+    if  {
+      console.log("ctx.me is undefined");
+      return;
+    }
+
+    // Skip if it's the bot itself
     if (member.user.id === ctx.me.id) {
       console.log("Ignoring chat_member event for the bot itself");
       return;
@@ -721,11 +786,12 @@ bot.on("chat_member", async (ctx) => {
         (!oldMember || oldMember.status !== "restricted" || 
          (oldMember.can_send_messages && !member.can_send_messages))) {
       
-      // Check if this user was recently verified to prevent re-restriction loops
-      if (isRecentlyVerified(userId, chatId)) {
-        console.log(`User ${userId} was recently verified, ignoring restriction and unrestricting`);
+      // CRITICAL FIX: Check if this user was recently verified or unrestricted by the bot
+      // This is the key to preventing re-restriction loops
+      if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId)) {
+        console.log(`User ${userId} was recently verified or unrestricted, ignoring restriction and unrestricting again`);
         
-        // Try to unrestrict the user again
+        // Try to unrestrict the user again immediately
         console.log(`Attempting to unrestrict recently verified user ${userId}`);
         await unrestrict(ctx.api, chatId, userId);
         return;
@@ -1009,8 +1075,10 @@ bot.command("debug", async (ctx) => {
     if (ctx.from) {
       const isVerifiedInDb = await checkVerifiedStatus(ctx.from.id, chatId);
       const isRecentlyVerifiedInMemory = isRecentlyVerified(ctx.from.id, chatId);
+      const isUnrestrictedByBot = wasUnrestrictedByBot(ctx.from.id, chatId);
       verifiedInfo = `\nVerified Status: ${isVerifiedInDb ? "✅ Verified in DB" : "❌ Not Verified in DB"}`;
       verifiedInfo += `\nRecently Verified (in-memory): ${isRecentlyVerifiedInMemory ? "✅ Yes" : "❌ No"}`;
+      verifiedInfo += `\nUnrestricted By Bot: ${isUnrestrictedByBot ? "✅ Yes" : "❌ No"}`;
       
       // Check if being processed
       const isBeingProcessed = isProcessing(ctx.from.id, chatId);
