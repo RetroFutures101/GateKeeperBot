@@ -1217,11 +1217,8 @@ bot.on("chat_member", async (ctx) => {
         (!oldMember || oldMember.status !== "restricted" || 
          (oldMember.can_send_messages && !member.can_send_messages))) {
       
-      // ADDITIONAL CHECK: If this restriction was done by our bot, don't process it again
-      if (wasRestrictedByBot(userId, chatId)) {
-        console.log(`User ${userId} was restricted by our bot, not generating a new captcha`);
-        return;
-      }
+      // FIXED: Don't skip captcha generation even if the bot restricted the user
+      // Instead, check if they already have a captcha
       
       // Check if user is already verified in the database
       const isVerified = await checkVerifiedStatus(userId, chatId);
