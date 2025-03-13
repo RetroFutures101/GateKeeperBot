@@ -639,21 +639,38 @@ async function storeVerifiedStatus(userId, chatId) {
 async function handleNewMember(ctx, userId, chatId, firstName, username) {
   console.log(`Handling new member: ${firstName} (${userId}) in chat ${chatId}`);
 
+  // ENHANCED LOGGING: Log all verification statuses for debugging
+  console.log(`Verification status for user ${userId} in chat ${chatId}:`);
+  console.log(`- Permanently verified: ${isPermanentlyVerified(userId, chatId)}`);
+  console.log(`- Recently verified: ${isRecentlyVerified(userId, chatId)}`);
+  console.log(`- Unrestricted by bot: ${wasUnrestrictedByBot(userId, chatId)}`);
+  console.log(`- Memory verified: ${memoryVerifiedUsers.has(`${userId}:${chatId}`)}`);
+  console.log(`- In grace period: ${isInGracePeriod(userId, chatId)}`);
+
   // NEW: Check if user is permanently verified
   if (isPermanentlyVerified(userId, chatId)) {
     console.log(`User ${userId} is permanently verified, not generating captcha`);
+    
+    // Ensure they're unrestricted
+    await unrestrict(ctx.api, chatId, userId);
     return;
   }
 
   // CRITICAL CHECK: If this user was recently verified or unrestricted by the bot, don't restrict them
   if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId) || memoryVerifiedUsers.has(`${userId}:${chatId}`)) {
     console.log(`User ${userId} is already verified, not generating captcha`);
+    
+    // Ensure they're unrestricted
+    await unrestrict(ctx.api, chatId, userId);
     return;
   }
 
   // NEW: Check if user is in grace period
   if (isInGracePeriod(userId, chatId)) {
     console.log(`User ${userId} is in grace period, not generating captcha`);
+    
+    // Ensure they're unrestricted
+    await unrestrict(ctx.api, chatId, userId);
     return;
   }
 
@@ -661,6 +678,9 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
   const isVerified = await checkVerifiedStatus(userId, chatId);
   if (isVerified) {
     console.log(`User ${userId} is already verified in database, not generating captcha`);
+    
+    // Ensure they're unrestricted
+    await unrestrict(ctx.api, chatId, userId);
     return;
   }
 
@@ -819,7 +839,7 @@ async function verifyCaptchaAndUnrestrict(ctx, userId, groupChatId, captchaRecor
   }
 }
 
-// Handle text messages (captcha verification) - MUST BE REGISTERED BEFORE THE GENERAL MESSAGE HANDLER
+// Handle text messages (captcha verification) - FIXED TO IGNORE /start COMMAND
 bot.on("message:text", async (ctx) => {
   try {
     // Safely check if required properties exist
@@ -832,6 +852,12 @@ bot.on("message:text", async (ctx) => {
     const userInput = ctx.message.text.trim();
     
     console.log(`Received text message: "${userInput}" from user ${userId}`);
+    
+    // IMPORTANT FIX: Skip processing if this is a /start command
+    if (userInput === "/start") {
+      console.log("Ignoring /start command in message:text handler");
+      return;
+    }
     
     // Check if this is a private chat
     if (ctx.chat.type === "private") {
@@ -1048,6 +1074,15 @@ bot.on("message", async (ctx) => {
     // Only reply with the test message if it's not already handled by the message:text handler
     // and it's a private chat with no pending captchas
     if (ctx.chat && ctx.chat.type === "private") {
+      // Skip if this is a /start command or text message (already handled)
+      if (ctx.message && ctx.message.text) {
+        if (ctx.message.text.trim() === "/start" || ctx.message.text.trim().startsWith("/")) {
+          return; // Skip command messages, they're handled by command handlers
+        }
+        // Skip text messages as they're handled by the message:text handler
+        return;
+      }
+      
       // Check if there are pending captchas for this user
       const userId = ctx.from.id;
       const { data, error } = await supabase
@@ -1066,7 +1101,7 @@ bot.on("message", async (ctx) => {
   }
 });
 
-// Handle new chat members via chat_member updates - ENHANCED WITH DEBUGGING
+// Handle new chat members via chat_member updates - ENHANCED TO RESPECT GRACE PERIOD
 bot.on("chat_member", async (ctx) => {
   try {
     console.log("chat_member event received");
@@ -1104,6 +1139,14 @@ bot.on("chat_member", async (ctx) => {
     const chatTitle = ctx.chat.title || "the group";
     
     console.log(`Processing chat_member event for user ${userId} with status ${member.status}`);
+    
+    // ENHANCED LOGGING: Log all verification statuses for debugging
+    console.log(`Verification status for user ${userId} in chat ${chatId}:`);
+    console.log(`- Permanently verified: ${isPermanentlyVerified(userId, chatId)}`);
+    console.log(`- Recently verified: ${isRecentlyVerified(userId, chatId)}`);
+    console.log(`- Unrestricted by bot: ${wasUnrestrictedByBot(userId, chatId)}`);
+    console.log(`- Memory verified: ${memoryVerifiedUsers.has(`${userId}:${chatId}`)}`);
+    console.log(`- In grace period: ${isInGracePeriod(userId, chatId)}`);
     
     // NEW: Check if user is permanently verified
     if (isPermanentlyVerified(userId, chatId)) {
@@ -1252,10 +1295,38 @@ bot.on("message:new_chat_members", async (ctx) => {
   }
 });
 
-// Handle the /start command
+// Handle the /start command - FIXED TO PROPERLY HANDLE START COMMAND IN PRIVATE CHATS
 bot.command("start", async (ctx) => {
   try {
     console.log("Received /start command");
+    
+    // Check if this user has pending captchas before showing the welcome message
+    if (ctx.chat && ctx.chat.type === "private" && ctx.from) {
+      const userId = ctx.from.id;
+      
+      // Check for pending captchas
+      const { data, error } = await supabase
+        .from("captchas")
+        .select("*")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false });
+      
+      if (!error && data && data.length > 0) {
+        // User has pending captchas, show them the captcha info
+        const captchaInfo = data.map(c => {
+          return `Chat: ${c.chat_id}\nCaptcha: ${c.captcha}`;
+        }).join("\n\n");
+        
+        await ctx.reply(
+          addAttribution(
+            `👋 Hello! I have pending captchas for you:\n\n${captchaInfo}\n\nPlease send the captcha code to verify yourself.`
+          )
+        );
+        return;
+      }
+    }
+    
+    // No pending captchas or not in private chat, show the standard welcome message
     await ctx.reply(
       addAttribution(
         "👋 Hello! I'm a captcha bot that helps protect groups from spam.\n\nAdd me to a group and grant me admin privileges to get started."
