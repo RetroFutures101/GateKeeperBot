@@ -11,6 +11,7 @@ const corsHeaders = {
 const UNRESTRICT_TIMEOUT = 8000; // 8 seconds to allow for Vercel's 10s timeout
 const UNRESTRICT_RETRY_DELAY = 1000; // 1 second between retries
 const MAX_UNRESTRICT_RETRIES = 3; // Maximum number of retries for unrestriction
+const GRACE_PERIOD = 60 * 1000; // 60 seconds grace period after verification
 
 // Helper function for delayed execution
 function delay(ms) {
@@ -52,6 +53,10 @@ const restrictingUsers = new Map();
 const unrestrictingUsers = new Map();
 // Track users who have pending captchas
 const pendingCaptchas = new Map();
+// Track users in grace period after verification
+const graceUsers = new Map();
+// Track permanently verified users (those who have sent a message after verification)
+const permanentlyVerifiedUsers = new Map();
 
 // Initialize session
 bot.use(
@@ -81,7 +86,48 @@ function addAttribution(message) {
 // Function to check if a user was recently verified
 function isRecentlyVerified(userId, chatId) {
   const key = `${userId}:${chatId}`;
-  return verifiedUsers.has(key) || memoryVerifiedUsers.has(key);
+  return verifiedUsers.has(key) || memoryVerifiedUsers.has(key) || permanentlyVerifiedUsers.has(key);
+}
+
+// Function to check if a user is in grace period
+function isInGracePeriod(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  return graceUsers.has(key);
+}
+
+// Function to mark a user as in grace period
+function markUserInGracePeriod(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  graceUsers.set(key, Date.now());
+
+  // Remove from grace period after the specified time
+  setTimeout(() => {
+    graceUsers.delete(key);
+    console.log(`Removed user ${userId} from grace period for chat ${chatId}`);
+  }, GRACE_PERIOD);
+
+  console.log(`Marked user ${userId} as in grace period for chat ${chatId}`);
+}
+
+// Function to mark a user as permanently verified (after sending a message)
+function markUserAsPermanentlyVerified(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  permanentlyVerifiedUsers.set(key, Date.now());
+
+  // This is permanent, but we'll still clean it up after a very long time (30 days)
+  // to prevent memory leaks in long-running instances
+  setTimeout(() => {
+    permanentlyVerifiedUsers.delete(key);
+    console.log(`Removed user ${userId} from permanently verified list for chat ${chatId} (cleanup)`);
+  }, 30 * 24 * 60 * 60 * 1000); // 30 days
+
+  console.log(`Marked user ${userId} as permanently verified in chat ${chatId}`);
+}
+
+// Function to check if a user is permanently verified
+function isPermanentlyVerified(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  return permanentlyVerifiedUsers.has(key);
 }
 
 // Function to mark a user as verified
@@ -278,6 +324,9 @@ async function unrestrict(api, chatId, userId) {
     markUserAsVerified(userId, chatId);
     markUserAsMemoryVerified(userId, chatId);
     markAsUnrestrictedByBot(userId, chatId);
+    
+    // NEW: Mark user as in grace period
+    markUserInGracePeriod(userId, chatId);
 
     // Store verified status in database but don't wait for it
     storeVerifiedStatus(userId, chatId).catch(err => {
@@ -359,6 +408,18 @@ async function restrictUser(api, chatId, userId) {
   // Check if already being restricted to prevent race conditions
   if (isBeingRestricted(userId, chatId)) {
     console.log(`User ${userId} is already being restricted, skipping`);
+    return false;
+  }
+
+  // NEW: Check if user is permanently verified
+  if (isPermanentlyVerified(userId, chatId)) {
+    console.log(`User ${userId} is permanently verified, not restricting`);
+    return false;
+  }
+
+  // NEW: Check if user is in grace period
+  if (isInGracePeriod(userId, chatId)) {
+    console.log(`User ${userId} is in grace period, not restricting`);
     return false;
   }
 
@@ -486,7 +547,7 @@ async function storeCaptcha(userId, chatId, captcha) {
 async function checkVerifiedStatus(userId, chatId) {
   try {
     // First check in memory for faster response
-    if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId) || memoryVerifiedUsers.has(`${userId}:${chatId}`)) {
+    if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId) || memoryVerifiedUsers.has(`${userId}:${chatId}`) || isPermanentlyVerified(userId, chatId)) {
       console.log(`User ${userId} is verified in memory for chat ${chatId}`);
       return true;
     }
@@ -578,9 +639,21 @@ async function storeVerifiedStatus(userId, chatId) {
 async function handleNewMember(ctx, userId, chatId, firstName, username) {
   console.log(`Handling new member: ${firstName} (${userId}) in chat ${chatId}`);
 
+  // NEW: Check if user is permanently verified
+  if (isPermanentlyVerified(userId, chatId)) {
+    console.log(`User ${userId} is permanently verified, not generating captcha`);
+    return;
+  }
+
   // CRITICAL CHECK: If this user was recently verified or unrestricted by the bot, don't restrict them
   if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId) || memoryVerifiedUsers.has(`${userId}:${chatId}`)) {
     console.log(`User ${userId} is already verified, not generating captcha`);
+    return;
+  }
+
+  // NEW: Check if user is in grace period
+  if (isInGracePeriod(userId, chatId)) {
+    console.log(`User ${userId} is in grace period, not generating captcha`);
     return;
   }
 
@@ -686,6 +759,10 @@ async function verifyCaptchaAndUnrestrict(ctx, userId, groupChatId, captchaRecor
       console.error("Error getting chat info:", chatError);
     }
 
+    // First, notify  {
+      console.error("Error getting chat info:", chatError);
+    }
+
     // First, notify the user that verification was successful
     await ctx.reply(addAttribution(`✅ Captcha verified successfully! You will gain access to ${chatTitle} in a few seconds.`));
 
@@ -693,6 +770,9 @@ async function verifyCaptchaAndUnrestrict(ctx, userId, groupChatId, captchaRecor
     markUserAsVerified(userId, groupChatId);
     markUserAsMemoryVerified(userId, groupChatId);
     markAsUnrestrictedByBot(userId, groupChatId);
+    
+    // NEW: Mark user as in grace period
+    markUserInGracePeriod(userId, groupChatId);
 
     // Remove from pending captchas
     markAsNotHavingPendingCaptcha(userId, groupChatId);
@@ -716,12 +796,12 @@ async function verifyCaptchaAndUnrestrict(ctx, userId, groupChatId, captchaRecor
       console.log(`Restrictions removed for user ${userId}`);
       
       // Send success messages
-      await ctx.reply(addAttribution(`✅ You now have full access to ${chatTitle}!`));
+      await ctx.reply(addAttribution(`✅ You now have full access to ${chatTitle}! Please send a message in the group within the next 60 seconds to confirm your membership.`));
       
       try {
         await ctx.api.sendMessage(
           groupChatId,
-          addAttribution(`✅ @${ctx.from.username || ctx.from.first_name} has verified their captcha and can now participate in the group.`)
+          addAttribution(`✅ @${ctx.from.username || ctx.from.first_name} has verified their captcha and can now participate in the group. Please send a message within 60 seconds to confirm your membership.`)
         );
       } catch (msgError) {
         console.error("Error sending group success message:", msgError);
@@ -858,6 +938,20 @@ bot.on("message:text", async (ctx) => {
     // If not a private chat, handle as before (for group messages)
     const chatId = ctx.chat.id;
 
+    // NEW: Check if user is in grace period and mark as permanently verified if they send a message
+    if (isInGracePeriod(userId, chatId)) {
+      console.log(`User ${userId} sent a message during grace period, marking as permanently verified`);
+      markUserAsPermanentlyVerified(userId, chatId);
+      
+      // Also store in database for persistence
+      storeVerifiedStatus(userId, chatId).catch(err => {
+        console.error("Error storing permanent verified status:", err);
+      });
+      
+      // No need to check for captcha since they're already verified
+      return;
+    }
+
     // Get the captcha from the database
     console.log(`Checking for captcha for user ${userId} in chat ${chatId}`);
     const { data, error } = await supabase
@@ -944,6 +1038,17 @@ bot.on("message", async (ctx) => {
       console.log("Message has no text");
     }
 
+    // NEW: Check if user is in grace period and mark as permanently verified if they send a message
+    if (ctx.from && ctx.chat && ctx.chat.type !== "private" && isInGracePeriod(ctx.from.id, ctx.chat.id)) {
+      console.log(`User ${ctx.from.id} sent a message during grace period, marking as permanently verified`);
+      markUserAsPermanentlyVerified(ctx.from.id, ctx.chat.id);
+      
+      // Also store in database for persistence
+      storeVerifiedStatus(ctx.from.id, ctx.chat.id).catch(err => {
+        console.error("Error storing permanent verified status:", err);
+      });
+    }
+
     // Only reply with the test message if it's not already handled by the message:text handler
     // and it's a private chat with no pending captchas
     if (ctx.chat && ctx.chat.type === "private") {
@@ -1003,6 +1108,32 @@ bot.on("chat_member", async (ctx) => {
     const chatTitle = ctx.chat.title || "the group";
     
     console.log(`Processing chat_member event for user ${userId} with status ${member.status}`);
+    
+    // NEW: Check if user is permanently verified
+    if (isPermanentlyVerified(userId, chatId)) {
+      console.log(`User ${userId} is permanently verified, ignoring restriction`);
+      
+      // If they're restricted, try to unrestrict them immediately
+      if (member.status === "restricted" && (!member.can_send_messages || !member.can_send_media_messages)) {
+        console.log(`User ${userId} is permanently verified but restricted, unrestricting`);
+        await unrestrict(ctx.api, chatId, userId);
+      }
+      
+      return;
+    }
+    
+    // NEW: Check if user is in grace period
+    if (isInGracePeriod(userId, chatId)) {
+      console.log(`User ${userId} is in grace period, ignoring restriction`);
+      
+      // If they're restricted, try to unrestrict them immediately
+      if (member.status === "restricted" && (!member.can_send_messages || !member.can_send_media_messages)) {
+        console.log(`User ${userId} is in grace period but restricted, unrestricting`);
+        await unrestrict(ctx.api, chatId, userId);
+      }
+      
+      return;
+    }
     
     // CRITICAL FIX: Check if this user was recently verified or unrestricted by the bot
     // This is the key to preventing re-restriction loops
@@ -1180,11 +1311,15 @@ bot.command("debug", async (ctx) => {
       const isRecentlyVerifiedInMemory = isRecentlyVerified(ctx.from.id, chatId);
       const isUnrestrictedByBot = wasUnrestrictedByBot(ctx.from.id, chatId);
       const isMemoryVerified = memoryVerifiedUsers.has(`${ctx.from.id}:${chatId}`);
+      const isPermanentVerified = isPermanentlyVerified(ctx.from.id, chatId);
+      const isGracePeriod = isInGracePeriod(ctx.from.id, chatId);
       
       verifiedInfo = `\nVerified Status: ${isVerifiedInDb ? "✅ Verified in DB" : "❌ Not Verified in DB"}`;
       verifiedInfo += `\nRecently Verified (in-memory): ${isRecentlyVerifiedInMemory ? "✅ Yes" : "❌ No"}`;
       verifiedInfo += `\nMemory-only Verified: ${isMemoryVerified ? "✅ Yes" : "❌ No"}`;
       verifiedInfo += `\nUnrestricted By Bot: ${isUnrestrictedByBot ? "✅ Yes" : "❌ No"}`;
+      verifiedInfo += `\nPermanently Verified: ${isPermanentVerified ? "✅ Yes" : "❌ No"}`;
+      verifiedInfo += `\nIn Grace Period: ${isGracePeriod ? "✅ Yes" : "❌ No"}`;
       
       // Check if being processed
       const isBeingProcessed = isProcessing(ctx.from.id, chatId);
@@ -1300,10 +1435,14 @@ bot.command("unrestrict", async (ctx) => {
     // Try to unrestrict the user
     try {
       await ctx.reply("Attempting to unrestrict user...");
+      
+      // Mark as permanently verified
+      markUserAsPermanentlyVerified(targetUserId, chatId);
+      
       const success = await unrestrict(ctx.api, chatId, targetUserId);
       
       if (success) {
-        await ctx.reply("✅ User has been unrestricted successfully and marked as verified!");
+        await ctx.reply("✅ User has been unrestricted successfully and marked as permanently verified!");
       } else {
         await ctx.reply("❌ Failed to unrestrict user. Please check bot permissions.");
       }
