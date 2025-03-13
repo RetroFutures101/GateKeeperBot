@@ -75,9 +75,7 @@ function generateCaptcha() {
 
 // Add the attribution footer to messages
 function addAttribution(message) {
-  return `${message}
-
-[created for you by POWERCITY.io](https://powercity.io)`;
+  return `${message}\n\n[created for you by POWERCITY.io](https://powercity.io)`;
 }
 
 // Function to check if a user was recently verified
@@ -652,11 +650,7 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
     await ctx.api.sendMessage(
       chatId,
       addAttribution(
-        `Welcome, ${firstName}!
-
-To gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:
-
-${captcha}`
+        `Welcome, ${firstName}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
       ),
     );
     console.log("Captcha message sent successfully");
@@ -1083,11 +1077,7 @@ bot.on("chat_member", async (ctx) => {
       await ctx.api.sendMessage(
         chatId,
         addAttribution(
-          `Welcome, ${member.user.first_name}!
-
-To gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:
-
-${captcha}`
+          `Welcome, ${member.user.first_name}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
         ),
       );
       console.log("Captcha message sent successfully");
@@ -1141,9 +1131,7 @@ bot.command("start", async (ctx) => {
     console.log("Received /start command");
     await ctx.reply(
       addAttribution(
-        "👋 Hello! I'm a captcha bot that helps protect groups from spam.
-
-Add me to a group and grant me admin privileges to get started.",
+        "👋 Hello! I'm a captcha bot that helps protect groups from spam.\n\nAdd me to a group and grant me admin privileges to get started."
       ),
     );
     console.log("Sent start message");
@@ -1179,13 +1167,9 @@ bot.command("debug", async (ctx) => {
         .eq("user_id", ctx.from.id);
       
       if (!error && data && data.length > 0) {
-        captchasInfo = `
-Pending Captchas: ${data.length}
-${data.map(c => `Chat ID: ${c.chat_id}, Captcha: ${c.captcha}, Attempts: ${c.attempts || 0}`).join("
-")}`;
+        captchasInfo = `\nPending Captchas: ${data.length}\n${data.map(c => `Chat ID: ${c.chat_id}, Captcha: ${c.captcha}, Attempts: ${c.attempts || 0}`).join("\n")}`;
       } else {
-        captchasInfo = "
-No pending captchas found for you.";
+        captchasInfo = "\nNo pending captchas found for you.";
       }
     }
 
@@ -1197,24 +1181,18 @@ No pending captchas found for you.";
       const isUnrestrictedByBot = wasUnrestrictedByBot(ctx.from.id, chatId);
       const isMemoryVerified = memoryVerifiedUsers.has(`${ctx.from.id}:${chatId}`);
       
-      verifiedInfo = `
-Verified Status: ${isVerifiedInDb ? "✅ Verified in DB" : "❌ Not Verified in DB"}`;
-      verifiedInfo += `
-Recently Verified (in-memory): ${isRecentlyVerifiedInMemory ? "✅ Yes" : "❌ No"}`;
-      verifiedInfo += `
-Memory-only Verified: ${isMemoryVerified ? "✅ Yes" : "❌ No"}`;
-      verifiedInfo += `
-Unrestricted By Bot: ${isUnrestrictedByBot ? "✅ Yes" : "❌ No"}`;
+      verifiedInfo = `\nVerified Status: ${isVerifiedInDb ? "✅ Verified in DB" : "❌ Not Verified in DB"}`;
+      verifiedInfo += `\nRecently Verified (in-memory): ${isRecentlyVerifiedInMemory ? "✅ Yes" : "❌ No"}`;
+      verifiedInfo += `\nMemory-only Verified: ${isMemoryVerified ? "✅ Yes" : "❌ No"}`;
+      verifiedInfo += `\nUnrestricted By Bot: ${isUnrestrictedByBot ? "✅ Yes" : "❌ No"}`;
       
       // Check if being processed
       const isBeingProcessed = isProcessing(ctx.from.id, chatId);
-      verifiedInfo += `
-Currently Being Processed: ${isBeingProcessed ? "✅ Yes" : "❌ No"}`;
+      verifiedInfo += `\nCurrently Being Processed: ${isBeingProcessed ? "✅ Yes" : "❌ No"}`;
       
       // Check if restricted by bot
       const isRestrictedByBot = wasRestrictedByBot(ctx.from.id, chatId);
-      verifiedInfo += `
-Restricted By Bot: ${isRestrictedByBot ? "✅ Yes" : "❌ No"}`;
+      verifiedInfo += `\nRestricted By Bot: ${isRestrictedByBot ? "✅ Yes" : "❌ No"}`;
     }
 
     // Test RLS bypass
@@ -1226,9 +1204,7 @@ Bot ID: ${botInfo.id}
 Bot Username: ${botInfo.username}
 Chat ID: ${chatId}
 Bot Status in Chat: ${chatMember.status}
-Bot Permissions: ${JSON.stringify(chatMember)}
-${captchasInfo}
-${verifiedInfo}
+Bot Permissions: ${JSON.stringify(chatMember)}${captchasInfo}${verifiedInfo}
 
 RLS Test: ${testResult}
       `),
@@ -1259,13 +1235,10 @@ bot.command("checkbot", async (ctx) => {
     
     console.log(`Bot permissions in chat ${chatId}:`, JSON.stringify(botMember));
     
-    let permissionText = "Bot Permissions in this group:
-";
+    let permissionText = "Bot Permissions in this group:\n";
     
     if (botMember.status === "administrator") {
-      permissionText += "✅ Bot is an administrator
-
-";
+      permissionText += "✅ Bot is an administrator\n\n";
       
       // Check specific permissions
       const permissions = [
@@ -1275,18 +1248,14 @@ bot.command("checkbot", async (ctx) => {
       ];
       
       for (const [perm, label] of permissions) {
-        permissionText += `${botMember[perm] ? "✅" : "❌"} ${label}
-`;
+        permissionText += `${botMember[perm] ? "✅" : "❌"} ${label}\n`;
       }
       
       if (!botMember.can_restrict_members) {
-        permissionText += "
-⚠️ The bot needs the 'Restrict members' permission to function properly!";
+        permissionText += "\n⚠️ The bot needs the 'Restrict members' permission to function properly!";
       }
     } else {
-      permissionText += "❌ Bot is NOT an administrator!
-
-Please make the bot an administrator with the 'Restrict members' permission.";
+      permissionText += "❌ Bot is NOT an administrator!\n\nPlease make the bot an administrator with the 'Restrict members' permission.";
     }
     
     await ctx.reply(addAttribution(permissionText));
