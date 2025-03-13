@@ -76,11 +76,11 @@ function markUserAsVerified(userId, chatId) {
   const key = `${userId}:${chatId}`;
   verifiedUsers.set(key, Date.now());
   
-  // Remove from verified list after 60 minutes to allow future captchas if needed
+  // Remove from verified list after 30 minutes to allow future captchas if needed
   setTimeout(() => {
     verifiedUsers.delete(key);
     console.log(`Removed user ${userId} from verified list for chat ${chatId}`);
-  }, 60 * 60 * 1000); // 60 minutes
+  }, 30 * 60 * 1000); // 30 minutes
   
   console.log(`Marked user ${userId} as verified in chat ${chatId}`);
 }
@@ -160,11 +160,14 @@ async function unrestrict(api, chatId, userId) {
     // Mark the user as verified BEFORE unrestricting to prevent re-restriction loops
     markUserAsVerified(userId, chatId);
     
-    // Store verified status in database - with better error handling
+    // Mark the user as unrestricted by the bot
+    markAsUnrestrictedByBot(userId, chatId);
+    
+    // Store verified status in database
     try {
       await storeVerifiedStatus(userId, chatId);
     } catch (dbError) {
-      console.error("Error storing verified status in database:", dbError);
+      console.error("Error storing verified status:", dbError);
       // Continue anyway, we'll rely on in-memory verification
     }
     
@@ -241,9 +244,6 @@ async function unrestrict(api, chatId, userId) {
     } catch (error) {
       console.log("Method 4 failed:", error.message);
     }
-    
-    // Mark the user as unrestricted by the bot
-    markAsUnrestrictedByBot(userId, chatId);
     
     console.log("All unrestriction methods attempted");
     return true;
@@ -758,12 +758,6 @@ bot.on("chat_member", async (ctx) => {
     }
 
     // Skip if it's the bot itself
-    if  {
-      console.log("ctx.me is undefined");
-      return;
-    }
-
-    // Skip if it's the bot itself
     if (member.user.id === ctx.me.id) {
       console.log("Ignoring chat_member event for the bot itself");
       return;
@@ -784,6 +778,9 @@ bot.on("chat_member", async (ctx) => {
     // Check if the user was just restricted (either by this bot or another admin)
     if (member.status === "restricted" && 
         (!oldMember || oldMember.status !== "restricted" || 
+         (oldMember.can_send_messages && !member.can_send_messages))) {
+      
+      //  || 
          (oldMember.can_send_messages && !member.can_send_messages))) {
       
       // CRITICAL FIX: Check if this user was recently verified or unrestricted by the bot
