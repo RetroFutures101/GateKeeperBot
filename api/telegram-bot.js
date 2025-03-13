@@ -706,7 +706,6 @@ async function storeVerifiedStatus(userId, chatId, permanent = false) {
       
       // If we're setting permanent and it's not already permanent, update it
       if (permanent && !existingData[0].permanent) {
-        console.log(`Updating user ${userId} to permanent verification in chat ${chat  {
         console.log(`Updating user ${userId} to permanent verification in chat ${chatId}`);
         
         const { error: updateError } = await supabase
@@ -873,15 +872,37 @@ async function handleNewMember(ctx, userId, chatId, firstName, username) {
       console.error("Error getting chat info:", chatError);
     }
     
-    // Send captcha message in the group
-    console.log("Sending captcha message");
+    // NEW APPROACH: Send a message in the group tagging the user to check their DMs
+    console.log("Sending DM notification message");
     await ctx.api.sendMessage(
       chatId,
       addAttribution(
-        `Welcome, ${firstName}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
+        `Welcome, ${firstName}! @${username || firstName}\n\nPlease check your direct messages from me to complete the captcha verification and gain access to ${chatTitle}.`
       ),
     );
-    console.log("Captcha message sent successfully");
+    
+    // Send the captcha directly to the user in a DM
+    try {
+      await ctx.api.sendMessage(
+        userId,
+        addAttribution(
+          `👋 Hello ${firstName}!\n\nTo gain access to ${chatTitle}, please reply to this message with the following captcha code:\n\n${captcha}`
+        )
+      );
+      console.log(`Sent captcha DM to user ${userId}`);
+    } catch (dmError) {
+      console.error("Error sending DM to user:", dmError);
+      
+      // If we can't send a DM, fall back to the old approach of sending the captcha in the group
+      await ctx.api.sendMessage(
+        chatId,
+        addAttribution(
+          `${firstName}, I couldn't send you a direct message. Please click on my username (@${ctx.me.username}) and start a chat with me, then send me this captcha code:\n\n${captcha}`
+        ),
+      );
+    }
+    
+    console.log("Captcha process initiated successfully");
     
     // Mark user as no longer being processed
     markAsNotProcessing(userId, chatId);
@@ -1372,15 +1393,35 @@ bot.on("chat_member", async (ctx) => {
       // Store the captcha in the database with attempts field - using the new function
       const stored = await storeCaptcha(userId, chatId, captcha);
       
-      // Send captcha message in the group
-      console.log("Sending captcha message");
+      // NEW APPROACH: Send a message in the group tagging the user to check their DMs
+      console.log("Sending DM notification message");
       await ctx.api.sendMessage(
         chatId,
         addAttribution(
-          `Welcome, ${member.user.first_name}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
+          `Welcome, ${member.user.first_name}! @${member.user.username || member.user.first_name}\n\nPlease check your direct messages from me to complete the captcha verification and gain access to ${chatTitle}.`
         ),
       );
-      console.log("Captcha message sent successfully");
+      
+      // Send the captcha directly to the user in a DM
+      try {
+        await ctx.api.sendMessage(
+          userId,
+          addAttribution(
+            `👋 Hello ${member.user.first_name}!\n\nTo gain access to ${chatTitle}, please reply to this message with the following captcha code:\n\n${captcha}`
+          )
+        );
+        console.log(`Sent captcha DM to user ${userId}`);
+      } catch (dmError) {
+        console.error("Error sending DM to user:", dmError);
+        
+        // If we can't send a DM, fall back to the old approach of sending the captcha in the group
+        await ctx.api.sendMessage(
+          chatId,
+          addAttribution(
+            `${member.user.first_name}, I couldn't send you a direct message. Please click on my username (@${ctx.me.username}) and start a chat with me, then send me this captcha code:\n\n${captcha}`
+          ),
+        );
+      }
     } 
     // Also handle new members joining
     else if (member.status === "member" && (!oldMember || oldMember.status !== "member")) {
@@ -1402,6 +1443,10 @@ bot.on("message:new_chat_members", async (ctx) => {
     
     // Safely check if required properties exist
     if (!ctx.message || !ctx.message.new_chat_members || !ctx.chat || !ctx.me) {
+      console.log("Missing required new_chat_members properties");
+      return;
+    }
+      {
       console.log("Missing required new_chat_members properties");
       return;
     }
