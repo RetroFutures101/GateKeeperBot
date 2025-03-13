@@ -759,8 +759,8 @@ async function verifyCaptchaAndUnrestrict(ctx, userId, groupChatId, captchaRecor
       console.error("Error getting chat info:", chatError);
     }
 
-    // First, notify  {
-      console.error("Error getting chat info:", chatError);
+    // First, notify the user that verification was successful
+    await ctx.  chatError);
     }
 
     // First, notify the user that verification was successful
