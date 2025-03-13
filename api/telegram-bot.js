@@ -33,6 +33,8 @@ console.log(`Supabase key: ${supabaseKey ? supabaseKey.substring(0, 5) + "..." :
 
 // Track recently verified users to prevent re-restriction loops
 const verifiedUsers = new Map();
+// Track users currently being processed to prevent concurrent operations
+const processingUsers = new Map();
 
 // Initialize session
 bot.use(
@@ -70,13 +72,40 @@ function markUserAsVerified(userId, chatId) {
   const key = `${userId}:${chatId}`;
   verifiedUsers.set(key, Date.now());
   
-  // Remove from verified list after 5 minutes to allow future captchas if needed
+  // Remove from verified list after 10 minutes to allow future captchas if needed
   setTimeout(() => {
     verifiedUsers.delete(key);
     console.log(`Removed user ${userId} from verified list for chat ${chatId}`);
-  }, 5 * 60 * 1000); // 5 minutes
+  }, 10 * 60 * 1000); // 10 minutes
   
   console.log(`Marked user ${userId} as verified in chat ${chatId}`);
+}
+
+// Function to check if a user is being processed
+function isProcessing(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  return processingUsers.has(key);
+}
+
+// Function to mark a user as being processed
+function markAsProcessing(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  processingUsers.set(key, Date.now());
+  
+  // Remove from processing list after 2 minutes to prevent deadlocks
+  setTimeout(() => {
+    processingUsers.delete(key);
+    console.log(`Removed user ${userId} from processing list for chat ${chatId}`);
+  }, 2 * 60 * 1000); // 2 minutes
+  
+  console.log(`Marked user ${userId} as being processed in chat ${chatId}`);
+}
+
+// Function to mark a user as no longer being processed
+function markAsNotProcessing(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  processingUsers.delete(key);
+  console.log(`Removed user ${userId} from processing list for chat ${chatId}`);
 }
 
 // Function to unrestrict a user with multiple approaches
@@ -84,6 +113,9 @@ async function unrestrict(api, chatId, userId) {
   console.log(`Attempting to unrestrict user ${userId} in chat ${chatId} using multiple methods`);
   
   try {
+    // Mark the user as verified BEFORE unrestricting to prevent re-restriction loops
+    markUserAsVerified(userId, chatId);
+    
     // First approach: Simple permission object (old style)
     console.log("Method 1: Using simple permission object (old style)");
     try {
@@ -144,22 +176,22 @@ async function unrestrict(api, chatId, userId) {
       console.log("Method 3 failed:", error.message);
     }
     
+    // Wait a moment between methods
+    await delay(1000);
+    
     // Fourth approach: Try promoteChatMember
     console.log("Method 4: Using promoteChatMember");
     try {
       await api.promoteChatMember(chatId, userId, {
-        can_send_messages: true,
-        can_send_media_messages: true,
-        can_send_other_messages: true,
-        can_add_web_page_previews: true
+        can_invite_users: true
       });
       console.log("Method 4 succeeded");
     } catch (error) {
       console.log("Method 4 failed:", error.message);
     }
     
-    // Mark the user as verified to prevent re-restriction loops
-    markUserAsVerified(userId, chatId);
+    // Store verified status in database
+    await storeVerifiedStatus(userId, chatId);
     
     console.log("All unrestriction methods attempted");
     return true;
@@ -339,6 +371,16 @@ bot.on("message:text", async (ctx) => {
         }
         
         if (captchaVerified) {
+          // Check if this user is already being processed
+          if (isProcessing(userId, groupChatId)) {
+            console.log(`User ${userId} is already being processed, ignoring duplicate verification`);
+            await ctx.reply("Your captcha is already being processed. Please wait a moment.");
+            return;
+          }
+          
+          // Mark user as being processed
+          markAsProcessing(userId, groupChatId);
+          
           // Correct captcha
           console.log(`Captcha correct for user ${userId}`);
           try {
@@ -357,9 +399,13 @@ bot.on("message:text", async (ctx) => {
             console.log("Sending initial success message to private chat");
             await ctx.reply(addAttribution(`✅ Captcha verified successfully! You will gain access to ${chatTitle} in a few seconds.`));
             
-            // Wait for 3 seconds before removing restrictions
-            console.log(`Waiting 3 seconds before removing restrictions for user ${userId}...`);
-            await delay(3000);
+            // Mark the user as verified BEFORE removing restrictions
+            markUserAsVerified(userId, groupChatId);
+            await storeVerifiedStatus(userId, groupChatId);
+            
+            // Wait for 5 seconds before removing restrictions
+            console.log(`Waiting 5 seconds before removing restrictions for user ${userId}...`);
+            await delay(5000);
             
             // Now remove restrictions using multiple methods
             console.log(`Removing restrictions for user ${userId} in chat ${groupChatId}`);
@@ -367,9 +413,6 @@ bot.on("message:text", async (ctx) => {
             
             if (success) {
               console.log(`Restrictions removed for user ${userId}`);
-              
-              // Mark user as verified in the database
-              await storeVerifiedStatus(userId, groupChatId);
               
               // Send a follow-up confirmation
               console.log("Sending final success message to private chat");
@@ -391,9 +434,14 @@ bot.on("message:text", async (ctx) => {
               console.error("Failed to remove restrictions");
               await ctx.reply("There was an error removing restrictions. Please contact the group admin.");
             }
+            
+            // Mark user as no longer being processed
+            markAsNotProcessing(userId, groupChatId);
             return;
           } catch (error) {
             console.error("Error verifying captcha:", error);
+            // Mark user as no longer being processed
+            markAsNotProcessing(userId, groupChatId);
             await ctx.reply("There was an error verifying your captcha. Please contact the group admin.");
             return;
           }
@@ -469,15 +517,29 @@ bot.on("message:text", async (ctx) => {
     
     console.log(`Comparing user input "${userInput}" with captcha "${captcha}"`);
     if (userInput === captcha) {
+      // Check if this user is already being processed
+      if (isProcessing(userId, chatId)) {
+        console.log(`User ${userId} is already being processed, ignoring duplicate verification`);
+        await ctx.reply("Your captcha is already being processed. Please wait a moment.");
+        return;
+      }
+      
+      // Mark user as being processed
+      markAsProcessing(userId, chatId);
+      
       // Correct captcha
       console.log(`Captcha correct for user ${userId}, waiting before removing restrictions...`);
       try {
         // First, notify the user that verification was successful
         await ctx.reply(addAttribution(`✅ Captcha verified successfully! You will gain access to the group in a few seconds.`));
         
-        // Wait for 3 seconds before removing restrictions
-        console.log(`Waiting 3 seconds before removing restrictions for user ${userId}...`);
-        await delay(3000);
+        // Mark the user as verified BEFORE removing restrictions
+        markUserAsVerified(userId, chatId);
+        await storeVerifiedStatus(userId, chatId);
+        
+        // Wait for 5 seconds before removing restrictions
+        console.log(`Waiting 5 seconds before removing restrictions for user ${userId}...`);
+        await delay(5000);
         
         // Now remove restrictions using multiple methods
         console.log(`Removing restrictions for user ${userId}`);
@@ -485,9 +547,6 @@ bot.on("message:text", async (ctx) => {
         
         if (success) {
           console.log(`Restrictions removed for user ${userId}`);
-          
-          // Mark user as verified in the database
-          await storeVerifiedStatus(userId, chatId);
           
           // Send success message
           console.log("Sending success message");
@@ -502,8 +561,13 @@ bot.on("message:text", async (ctx) => {
           console.error("Failed to remove restrictions");
           await ctx.reply("There was an error removing restrictions. Please contact the group admin.");
         }
+        
+        // Mark user as no longer being processed
+        markAsNotProcessing(userId, chatId);
       } catch (error) {
         console.error("Error verifying captcha:", error);
+        // Mark user as no longer being processed
+        markAsNotProcessing(userId, chatId);
       }
     } else {
       // Incorrect captcha
@@ -629,7 +693,7 @@ bot.on("chat_member", async (ctx) => {
       
       // Check if this user was recently verified to prevent re-restriction loops
       if (isRecentlyVerified(userId, chatId)) {
-        console.log(`User ${userId} was recently verified, ignoring restriction`);
+        console.log(`User ${userId} was recently verified, ignoring restriction and unrestricting`);
         
         // Try to unrestrict the user again
         console.log(`Attempting to unrestrict recently verified user ${userId}`);
@@ -689,6 +753,10 @@ bot.on("chat_member", async (ctx) => {
       // Restrict the user until they solve the captcha
       try {
         console.log(`Restricting user ${userId} in chat ${chatId}`);
+        
+        // Mark the user as being processed to prevent concurrent operations
+        markAsProcessing(userId, chatId);
+        
         await ctx.api.restrictChatMember(chatId, userId, {
           permissions: {
             can_send_messages: false,
@@ -715,8 +783,13 @@ bot.on("chat_member", async (ctx) => {
         } else {
           console.error("Failed to store captcha, not sending message");
         }
+        
+        // Mark user as no longer being processed
+        markAsNotProcessing(userId, chatId);
       } catch (error) {
         console.error("Error handling new member:", error);
+        // Mark user as no longer being processed
+        markAsNotProcessing(userId, chatId);
       }
     } else {
       console.log(`Ignoring chat_member event: status=${member.status}, old_status=${oldMember ? oldMember.status : 'unknown'}`);
@@ -766,6 +839,10 @@ bot.on("message:new_chat_members", async (ctx) => {
       // Restrict the user until they solve the captcha
       try {
         console.log(`Attempting to restrict user ${userId} in chat ${chatId}`);
+        
+        // Mark the user as being processed to prevent concurrent operations
+        markAsProcessing(userId, chatId);
+        
         await ctx.api.restrictChatMember(chatId, userId, {
           permissions: {
             can_send_messages: false,
@@ -790,8 +867,13 @@ bot.on("message:new_chat_members", async (ctx) => {
         } else {
           console.error("Failed to store captcha, not sending message");
         }
+        
+        // Mark user as no longer being processed
+        markAsNotProcessing(userId, chatId);
       } catch (error) {
         console.error(`Error handling new member ${userId}:`, error);
+        // Mark user as no longer being processed
+        markAsNotProcessing(userId, chatId);
       }
     }
   } catch (error) {
@@ -850,12 +932,14 @@ bot.command("debug", async (ctx) => {
     // Check verified status
     let verifiedInfo = "";
     if (ctx.from) {
-      const isVerified = await checkVerifiedStatus(ctx.from.id, chatId);
-      verifiedInfo = `\nVerified Status: ${isVerified ? "✅ Verified" : "❌ Not Verified"}`;
-      
-      // Also check in-memory verification
+      const isVerifiedInDb = await checkVerifiedStatus(ctx.from.id, chatId);
       const isRecentlyVerifiedInMemory = isRecentlyVerified(ctx.from.id, chatId);
+      verifiedInfo = `\nVerified Status: ${isVerifiedInDb ? "✅ Verified in DB" : "❌ Not Verified in DB"}`;
       verifiedInfo += `\nRecently Verified (in-memory): ${isRecentlyVerifiedInMemory ? "✅ Yes" : "❌ No"}`;
+      
+      // Check if being processed
+      const isBeingProcessed = isProcessing(ctx.from.id, chatId);
+      verifiedInfo += `\nCurrently Being Processed: ${isBeingProcessed ? "✅ Yes" : "❌ No"}`;
     }
 
     // Test RLS bypass
@@ -968,8 +1052,6 @@ bot.command("unrestrict", async (ctx) => {
       const success = await unrestrict(ctx.api, chatId, targetUserId);
       
       if (success) {
-        // Mark user as verified in the database
-        await storeVerifiedStatus(targetUserId, chatId);
         await ctx.reply("✅ User has been unrestricted successfully and marked as verified!");
       } else {
         await ctx.reply("❌ Failed to unrestrict user. Please check bot permissions.");
@@ -1030,51 +1112,6 @@ bot.command("clearcaptcha", async (ctx) => {
     }
   } catch (error) {
     console.error("Error in clearcaptcha command:", error);
-    if (ctx.chat) {
-      await ctx.reply("Error processing command: " + error.message);
-    }
-  }
-});
-
-// Add a command to mark a user as verified
-bot.command("verify", async (ctx) => {
-  try {
-    console.log("Received /verify command");
-    
-    // Only process in group chats
-    if (!ctx.chat || (ctx.chat.type !== "group" && ctx.chat.type !== "supergroup")) {
-      await ctx.reply("This command only works in groups.");
-      return;
-    }
-    
-    // Check if the command is a reply to a message
-    if (!ctx.message || !ctx.message.reply_to_message) {
-      await ctx.reply("Please use this command as a reply to a message from the user you want to mark as verified.");
-      return;
-    }
-    
-    const targetUserId = ctx.message.reply_to_message.from.id;
-    const chatId = ctx.chat.id;
-    
-    console.log(`Attempting to mark user ${targetUserId} as verified in chat ${chatId}`);
-    
-    // Check if the user is an admin
-    const senderMember = await ctx.api.getChatMember(chatId, ctx.from.id);
-    if (senderMember.status !== "administrator" && senderMember.status !== "creator") {
-      await ctx.reply("Only administrators can use this command.");
-      return;
-    }
-    
-    // Mark user as verified
-    const success = await storeVerifiedStatus(targetUserId, chatId);
-    
-    if (success) {
-      await ctx.reply("✅ User has been marked as verified!");
-    } else {
-      await ctx.reply("❌ Failed to mark user as verified.");
-    }
-  } catch (error) {
-    console.error("Error in verify command:", error);
     if (ctx.chat) {
       await ctx.reply("Error processing command: " + error.message);
     }
