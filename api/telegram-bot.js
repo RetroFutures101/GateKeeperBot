@@ -41,6 +41,8 @@ const restrictedByBot = new Map();
 const unrestrictedByBot = new Map();
 // Track users who have failed database verification but are verified in memory
 const memoryVerifiedUsers = new Map();
+// Track users who are currently being restricted to prevent race conditions
+const restrictingUsers = new Map();
 
 // Initialize session
 bot.use(
@@ -126,6 +128,33 @@ function markAsNotProcessing(userId, chatId) {
   const key = `${userId}:${chatId}`;
   processingUsers.delete(key);
   console.log(`Removed user ${userId} from processing list for chat ${chatId}`);
+}
+
+// Function to check if a user is currently being restricted
+function isBeingRestricted(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  return restrictingUsers.has(key);
+}
+
+// Function to mark a user as being restricted
+function markAsBeingRestricted(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  restrictingUsers.set(key, Date.now());
+  
+  // Remove from restricting list after 30 seconds to prevent deadlocks
+  setTimeout(() => {
+    restrictingUsers.delete(key);
+    console.log(`Removed user ${userId} from restricting list for chat ${chatId}`);
+  }, 30 * 1000); // 30 seconds
+  
+  console.log(`Marked user ${userId} as being restricted in chat ${chatId}`);
+}
+
+// Function to mark a user as no longer being restricted
+function markAsNotBeingRestricted(userId, chatId) {
+  const key = `${userId}:${chatId}`;
+  restrictingUsers.delete(key);
+  console.log(`Removed user ${userId} from restricting list for chat ${chatId}`);
 }
 
 // Function to mark a user as restricted by the bot
@@ -275,6 +304,52 @@ async function unrestrict(api, chatId, userId) {
   }
 }
 
+// Function to restrict a user
+async function restrictUser(api, chatId, userId) {
+  console.log(`Attempting to restrict user ${userId} in chat ${chatId}`);
+  
+  // Check if already being restricted to prevent race conditions
+  if (isBeingRestricted(userId, chatId)) {
+    console.log(`User ${userId} is already being restricted, skipping`);
+    return false;
+  }
+  
+  // Check if already verified to prevent restricting verified users
+  if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId) || memoryVerifiedUsers.has(`${userId}:${chatId}`)) {
+    console.log(`User ${userId} is verified, not restricting`);
+    return false;
+  }
+  
+  try {
+    // Mark as being restricted to prevent concurrent operations
+    markAsBeingRestricted(userId, chatId);
+    
+    // Mark that this restriction was done by the bot
+    markAsRestrictedByBot(userId, chatId);
+    
+    // Perform the restriction
+    await api.restrictChatMember(chatId, userId, {
+      permissions: {
+        can_send_messages: false,
+        can_send_media_messages: false,
+        can_send_other_messages: false,
+        can_add_web_page_previews: false
+      }
+    });
+    
+    console.log(`Successfully restricted user ${userId} in chat ${chatId}`);
+    
+    // Mark as no longer being restricted
+    markAsNotBeingRestricted(userId, chatId);
+    return true;
+  } catch (error) {
+    console.error(`Error restricting user ${userId} in chat ${chatId}:`, error);
+    // Mark as no longer being restricted
+    markAsNotBeingRestricted(userId, chatId);
+    return false;
+  }
+}
+
 // Function to store captcha in database with upsert
 async function storeCaptcha(userId, chatId, captcha) {
   console.log(`Attempting to store captcha in database: user_id=${userId}, chat_id=${chatId}, captcha=${captcha}`);
@@ -327,7 +402,7 @@ async function storeCaptcha(userId, chatId, captcha) {
 async function checkVerifiedStatus(userId, chatId) {
   try {
     // First check in memory for faster response
-    if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId)) {
+    if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId) || memoryVerifiedUsers.has(`${userId}:${chatId}`)) {
       console.log(`User ${userId} is verified in memory for chat ${chatId}`);
       return true;
     }
@@ -412,6 +487,91 @@ async function storeVerifiedStatus(userId, chatId) {
     // Mark as memory-verified as a fallback
     markUserAsMemoryVerified(userId, chatId);
     return false;
+  }
+}
+
+// Function to handle new members (shared logic between chat_member and message:new_chat_members)
+async function handleNewMember(ctx, userId, chatId, firstName, username) {
+  console.log(`Handling new member: ${firstName} (${userId}) in chat ${chatId}`);
+  
+  // CRITICAL CHECK: If this user was recently verified or unrestricted by the bot, don't restrict them
+  if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId) || memoryVerifiedUsers.has(`${userId}:${chatId}`)) {
+    console.log(`User ${userId} is already verified, not generating captcha`);
+    return;
+  }
+  
+  // Check if this user is already verified in the database
+  const isVerified = await checkVerifiedStatus(userId, chatId);
+  if (isVerified) {
+    console.log(`User ${userId} is already verified in database, not generating captcha`);
+    return;
+  }
+  
+  // Check if the user already has a captcha
+  const { data, error } = await supabase
+    .from("captchas")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("chat_id", chatId)
+    .limit(1);
+  
+  if (!error && data && data.length > 0) {
+    console.log(`User ${userId} already has a captcha, not generating a new one`);
+    return;
+  }
+  
+  // Generate a new captcha
+  const captcha = generateCaptcha();
+  console.log(`Generated captcha: ${captcha} for user ${userId}`);
+  
+  // Restrict the user until they solve the captcha
+  try {
+    // Mark the user as being processed to prevent concurrent operations
+    markAsProcessing(userId, chatId);
+    
+    // Restrict the user
+    const restrictSuccess = await restrictUser(ctx.api, chatId, userId);
+    
+    if (!restrictSuccess) {
+      console.log(`Failed to restrict user ${userId}, aborting captcha generation`);
+      markAsNotProcessing(userId, chatId);
+      return;
+    }
+    
+    // Store the captcha in the database
+    const stored = await storeCaptcha(userId, chatId, captcha);
+    
+    if (stored) {
+      // Get chat title
+      let chatTitle = "the group";
+      try {
+        const chatInfo = await ctx.api.getChat(chatId);
+        if (chatInfo && chatInfo.title) {
+          chatTitle = chatInfo.title;
+        }
+      } catch (chatError) {
+        console.error("Error getting chat info:", chatError);
+      }
+      
+      // Send captcha message in the group
+      console.log("Sending captcha message");
+      await ctx.api.sendMessage(
+        chatId,
+        addAttribution(
+          `Welcome, ${firstName}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
+        ),
+      );
+      console.log("Captcha message sent successfully");
+    } else {
+      console.error("Failed to store captcha, not sending message");
+    }
+    
+    // Mark user as no longer being processed
+    markAsNotProcessing(userId, chatId);
+  } catch (error) {
+    console.error("Error handling new member:", error);
+    // Mark user as no longer being processed
+    markAsNotProcessing(userId, chatId);
   }
 }
 
@@ -763,7 +923,6 @@ bot.on("message", async (ctx) => {
       
       if (error || !data || data.length === 0) {
         // No captchas found, send the welcome message
-        await ctx.reply(addAttribution("I received your message! This  send the welcome message
         await ctx.reply(addAttribution("I received your message! This confirms the webhook is working."));
       }
     }
@@ -885,83 +1044,8 @@ bot.on("chat_member", async (ctx) => {
     } 
     // Also handle new members joining
     else if (member.status === "member" && (!oldMember || oldMember.status !== "member")) {
-      // New member joined
-      console.log(`New member joined: ${member.user.first_name} (${member.user.id})`);
-      
-      // CRITICAL CHECK: If this user was recently verified or unrestricted by the bot, don't restrict them
-      if (isRecentlyVerified(userId, chatId) || wasUnrestrictedByBot(userId, chatId) || memoryVerifiedUsers.has(`${userId}:${chatId}`)) {
-        console.log(`User ${userId} is already verified, not generating captcha`);
-        return;
-      }
-      
-      // Check if this user is already verified
-      const isVerified = await checkVerifiedStatus(userId, chatId);
-      if (isVerified) {
-        console.log(`User ${userId} is already verified, not generating captcha`);
-        return;
-      }
-      
-      // Check if the user already has a captcha
-      const { data, error } = await supabase
-        .from("captchas")
-        .select("*")
-        .eq("user_id", userId)
-        .eq("chat_id", chatId)
-        .limit(1);
-      
-      if (!error && data && data.length > 0) {
-        console.log(`User ${userId} already has a captcha, not generating a new one`);
-        return;
-      }
-      
-      // Generate a new captcha
-      const captcha = generateCaptcha();
-      console.log(`Generated captcha: ${captcha} for user ${userId}`);
-
-      // Restrict the user until they solve the captcha
-      try {
-        console.log(`Restricting user ${userId} in chat ${chatId}`);
-        
-        // Mark the user as being processed to prevent concurrent operations
-        markAsProcessing(userId, chatId);
-        
-        // Mark that this restriction was done by the bot
-        markAsRestrictedByBot(userId, chatId);
-        
-        await ctx.api.restrictChatMember(chatId, userId, {
-          permissions: {
-            can_send_messages: false,
-            can_send_media_messages: false,
-            can_send_other_messages: false,
-            can_add_web_page_previews: false
-          }
-        });
-        console.log(`User ${userId} restricted successfully`);
-
-        // Store the captcha in the database with attempts field - using the new function
-        const stored = await storeCaptcha(userId, chatId, captcha);
-        
-        if (stored) {
-          // Send captcha message in the group
-          console.log("Sending captcha message");
-          await ctx.api.sendMessage(
-            chatId,
-            addAttribution(
-              `Welcome, ${member.user.first_name}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`
-            ),
-          );
-          console.log("Captcha message sent successfully");
-        } else {
-          console.error("Failed to store captcha, not sending message");
-        }
-        
-        // Mark user as no longer being processed
-        markAsNotProcessing(userId, chatId);
-      } catch (error) {
-        console.error("Error handling new member:", error);
-        // Mark user as no longer being processed
-        markAsNotProcessing(userId, chatId);
-      }
+      // Use the shared handler for new members
+      await handleNewMember(ctx, userId, chatId, member.user.first_name, member.user.username);
     } else {
       console.log(`Ignoring chat_member event: status=${member.status}, old_status=${oldMember ? oldMember.status : 'unknown'}`);
     }
@@ -992,76 +1076,9 @@ bot.on("message:new_chat_members", async (ctx) => {
       }
       
       console.log(`Processing new member: ${member.first_name} (${member.id})`);
-      const userId = member.id;
-      const chatId = ctx.chat.id;
-      const chatTitle = ctx.chat.title || "the group";
       
-      // Check if this user is already verified
-      const isVerified = await checkVerifiedStatus(userId, chatId);
-      if (isVerified) {
-        console.log(`User ${userId} is already verified, not generating captcha`);
-        continue;
-      }
-      
-      // Check if the user already has a captcha
-      const { data, error } = await supabase
-        .from("captchas")
-        .select("*")
-        .eq("user_id", userId)
-        .eq("chat_id", chatId)
-        .limit(1);
-      
-      if (!error && data && data.length > 0) {
-        console.log(`User ${userId} already has a captcha, not generating a new one`);
-        continue;
-      }
-      
-      // Generate a new captcha
-      const captcha = generateCaptcha();
-      console.log(`Generated captcha: ${captcha} for user ${userId}`);
-      
-      // Restrict the user until they solve the captcha
-      try {
-        console.log(`Attempting to restrict user ${userId} in chat ${chatId}`);
-        
-        // Mark the user as being processed to prevent concurrent operations
-        markAsProcessing(userId, chatId);
-        
-        // Mark that this restriction was done by the bot
-        markAsRestrictedByBot(userId, chatId);
-        
-        await ctx.api.restrictChatMember(chatId, userId, {
-          permissions: {
-            can_send_messages: false,
-            can_send_media_messages: false,
-            can_send_other_messages: false,
-            can_add_web_page_previews: false
-          }
-        });
-        console.log(`Successfully restricted user ${userId}`);
-        
-        // Store the captcha in the database with attempts field - using the new function
-        const stored = await storeCaptcha(userId, chatId, captcha);
-        
-        if (stored) {
-          // Send captcha message in the group
-          console.log("Sending captcha message");
-          await ctx.api.sendMessage(
-            chatId,
-            addAttribution(`Welcome, ${member.first_name}!\n\nTo gain access to ${chatTitle}, please click on my username (@${ctx.me.username}) and send me this captcha code in a private message:\n\n${captcha}`)
-          );
-          console.log("Captcha message sent successfully");
-        } else {
-          console.error("Failed to store captcha, not sending message");
-        }
-        
-        // Mark user as no longer being processed
-        markAsNotProcessing(userId, chatId);
-      } catch (error) {
-        console.error(`Error handling new member ${userId}:`, error);
-        // Mark user as no longer being processed
-        markAsNotProcessing(userId, chatId);
-      }
+      // Use the shared handler for new members
+      await handleNewMember(ctx, member.id, ctx.chat.id, member.first_name, member.username);
     }
   } catch (error) {
     console.error("Error in new_chat_members handler:", error);
