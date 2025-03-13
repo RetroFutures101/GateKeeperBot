@@ -76,11 +76,11 @@ function markUserAsVerified(userId, chatId) {
   const key = `${userId}:${chatId}`;
   verifiedUsers.set(key, Date.now());
   
-  // Remove from verified list after 30 minutes to allow future captchas if needed
+  // Remove from verified list after 60 minutes to allow future captchas if needed
   setTimeout(() => {
     verifiedUsers.delete(key);
     console.log(`Removed user ${userId} from verified list for chat ${chatId}`);
-  }, 30 * 60 * 1000); // 30 minutes
+  }, 60 * 60 * 1000); // 60 minutes
   
   console.log(`Marked user ${userId} as verified in chat ${chatId}`);
 }
@@ -163,11 +163,11 @@ async function unrestrict(api, chatId, userId) {
     // Mark the user as unrestricted by the bot
     markAsUnrestrictedByBot(userId, chatId);
     
-    // Store verified status in database
+    // Store verified status in database - with better error handling
     try {
       await storeVerifiedStatus(userId, chatId);
     } catch (dbError) {
-      console.error("Error storing verified status:", dbError);
+      console.error("Error storing verified status in database:", dbError);
       // Continue anyway, we'll rely on in-memory verification
     }
     
@@ -778,9 +778,6 @@ bot.on("chat_member", async (ctx) => {
     // Check if the user was just restricted (either by this bot or another admin)
     if (member.status === "restricted" && 
         (!oldMember || oldMember.status !== "restricted" || 
-         (oldMember.can_send_messages && !member.can_send_messages))) {
-      
-      //  || 
          (oldMember.can_send_messages && !member.can_send_messages))) {
       
       // CRITICAL FIX: Check if this user was recently verified or unrestricted by the bot
